@@ -302,8 +302,16 @@ func parseCEFromHeaders(msg Message) (event.Event, bool) {
 		headers[strings.ToLower(h.Key)] = string(h.Value)
 	}
 
-	if _, ok := headers["ce_specversion"]; !ok {
-		return event.Event{}, false
+	// A binary-mode CloudEvent requires all four mandatory context attributes
+	// (specversion, id, source, type). Treat the record as a pass-through CE only
+	// when every one is present; a record carrying ce_specversion but missing any
+	// of the others is a malformed/partial CE that would fail outbound validation
+	// on every encode and wedge the partition. In that case return false so the
+	// caller wraps it as a fresh event instead.
+	for _, h := range []string{"ce_specversion", "ce_id", "ce_source", "ce_type"} {
+		if _, ok := headers[h]; !ok {
+			return event.Event{}, false
+		}
 	}
 
 	e := event.New()

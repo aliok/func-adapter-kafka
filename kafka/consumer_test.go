@@ -286,14 +286,17 @@ func TestKafkaMessageToEvent_NotCE(t *testing.T) {
 }
 
 func TestKafkaMessageToEvent_CEPassThrough_MissingAttributes(t *testing.T) {
-	// Message has ce_specversion but is missing ce_id, ce_source, ce_type.
-	// It should still be treated as a CE pass-through (not wrapped), and the
-	// missing required attributes should be empty strings.
+	// A record carrying ce_specversion but missing a mandatory attribute
+	// (here ce_source and ce_type) is a partial/malformed CloudEvent. Passing it
+	// through would produce an event that fails outbound validation on every
+	// encode and wedge the partition, so it must fall through to the wrap path
+	// and come out as a fresh, valid event.
 	msg := Message{
 		Value: []byte(`{"data":"value"}`),
 		Topic: "events",
 		Headers: []Header{
 			{Key: "ce_specversion", Value: []byte("1.0")},
+			{Key: "ce_id", Value: []byte("abc")},
 		},
 		Partition: 0,
 		Offset:    10,
@@ -301,24 +304,53 @@ func TestKafkaMessageToEvent_CEPassThrough_MissingAttributes(t *testing.T) {
 
 	e := kafkaMessageToEvent(msg, "b:9092")
 
-	// Should be treated as CE pass-through, not the generated wrapper.
-	if e.SpecVersion() != "1.0" {
-		t.Errorf("specversion = %q, want 1.0", e.SpecVersion())
+	// Must be the generated wrapper, not a pass-through: the wrapper sets type,
+	// a partition/offset id, and a kafka:// source, and the resulting event must
+	// validate.
+	if err := e.Validate(); err != nil {
+		t.Fatalf("wrapped event failed Validate(): %v", err)
 	}
-	// The wrapper would set type to "dev.knative.kafka.event", so verify it is
-	// empty (CE pass-through with missing ce_type).
-	if e.Type() != "" {
-		t.Errorf("type = %q, want empty string", e.Type())
+	if e.Type() != "dev.knative.kafka.event" {
+		t.Errorf("type = %q, want dev.knative.kafka.event", e.Type())
 	}
-	if e.ID() != "" {
-		t.Errorf("id = %q, want empty string", e.ID())
+	if e.ID() != "partition:0/offset:10" {
+		t.Errorf("id = %q, want partition:0/offset:10", e.ID())
 	}
-	if e.Source() != "" {
-		t.Errorf("source = %q, want empty string", e.Source())
+	if e.Source() != "kafka://b:9092/events" {
+		t.Errorf("source = %q, want kafka://b:9092/events", e.Source())
 	}
-	// Data should still be set.
 	if string(e.Data()) != `{"data":"value"}` {
 		t.Errorf("data = %q", string(e.Data()))
+	}
+}
+
+// TestKafkaMessageToEvent_CEPassThrough_Complete verifies that a record carrying
+// all four mandatory ce_ attributes is passed through verbatim rather than
+// wrapped.
+func TestKafkaMessageToEvent_CEPassThrough_Complete(t *testing.T) {
+	msg := Message{
+		Value: []byte(`{"data":"value"}`),
+		Topic: "events",
+		Headers: []Header{
+			{Key: "ce_specversion", Value: []byte("1.0")},
+			{Key: "ce_id", Value: []byte("evt-1")},
+			{Key: "ce_source", Value: []byte("/my/source")},
+			{Key: "ce_type", Value: []byte("com.example.thing")},
+		},
+		Partition: 0,
+		Offset:    10,
+	}
+
+	e := kafkaMessageToEvent(msg, "b:9092")
+
+	if e.ID() != "evt-1" {
+		t.Errorf("id = %q, want evt-1 (pass-through)", e.ID())
+	}
+	if e.Source() != "/my/source" {
+		t.Errorf("source = %q, want /my/source (pass-through)", e.Source())
+	}
+	if e.Type() != "com.example.thing" {
+		t.Errorf("type = %q, want com.example.thing (pass-through)", e.Type())
 	}
 }
 
