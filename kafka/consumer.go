@@ -18,12 +18,15 @@ package kafka
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/IBM/sarama"
 	"github.com/cloudevents/sdk-go/v2/event"
@@ -246,9 +249,6 @@ func kafkaMessageToEvent(msg Message, brokers string) event.Event {
 	e.SetSource(fmt.Sprintf("kafka://%s/%s", brokers, msg.Topic))
 	e.SetType("dev.knative.kafka.event")
 	e.SetTime(msg.Timestamp)
-	if len(msg.Key) > 0 {
-		e.SetSubject(string(msg.Key))
-	}
 	_ = e.SetData("application/octet-stream", msg.Value)
 	e.SetExtension("kafkatopic", msg.Topic)
 	e.SetExtension("kafkapartition", msg.Partition)
@@ -260,9 +260,38 @@ func kafkaMessageToEvent(msg Message, brokers string) event.Event {
 	// the event ID, so no information is lost.
 	e.SetExtension("kafkaoffset", strconv.FormatInt(msg.Offset, 10))
 	if len(msg.Key) > 0 {
-		e.SetExtension("kafkakey", string(msg.Key))
+		// The Kafka key is arbitrary bytes. Always expose the full key
+		// base64-encoded as the kafkakey extension: base64 output is header-safe
+		// ASCII, so it can never carry CR/LF or invalid UTF-8 that net/http (or
+		// CloudEvents string validation) would reject client-side on every encode
+		// and wedge the partition. Consumers always base64-decode kafkakey.
+		e.SetExtension("kafkakey", base64.StdEncoding.EncodeToString(msg.Key))
+		// subject is an optional human-readable descriptor. Set it to the raw key
+		// only when the key is header-safe text; otherwise omit it (the full key
+		// is still in kafkakey). Gating this keeps the common text-key case
+		// readable without ever wedging on a binary/non-UTF-8 key.
+		if keyHeaderSafe(msg.Key) {
+			e.SetSubject(string(msg.Key))
+		}
 	}
 	return e
+}
+
+// keyHeaderSafe reports whether key can be carried verbatim as a CloudEvents
+// string attribute / HTTP header value: it must be valid UTF-8 with no control
+// characters (CR, LF, NUL, etc.), which net/http and CloudEvents string
+// validation would otherwise reject.
+func keyHeaderSafe(key []byte) bool {
+	s := string(key)
+	if !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // parseCEFromHeaders checks if the Kafka message is already a CloudEvent

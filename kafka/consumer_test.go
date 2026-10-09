@@ -18,6 +18,7 @@ package kafka
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strconv"
@@ -75,8 +76,37 @@ func TestKafkaMessageToEvent(t *testing.T) {
 	if fmt.Sprintf("%v", exts["kafkaoffset"]) != "42" {
 		t.Errorf("kafkaoffset = %v", exts["kafkaoffset"])
 	}
-	if exts["kafkakey"] != "my-key" {
-		t.Errorf("kafkakey = %v", exts["kafkakey"])
+	if want := base64.StdEncoding.EncodeToString([]byte("my-key")); exts["kafkakey"] != want {
+		t.Errorf("kafkakey = %v, want %v (base64 of my-key)", exts["kafkakey"], want)
+	}
+}
+
+// TestKafkaMessageToEvent_BinaryKey guards the #2 fix: a key with bytes that are
+// not header-safe (here a NUL and invalid UTF-8) must not wedge the partition.
+// kafkakey carries the full key base64-encoded, subject is omitted rather than
+// set to the raw bytes, and the event must validate (encode client-side).
+func TestKafkaMessageToEvent_BinaryKey(t *testing.T) {
+	key := []byte{0x00, 0x0a, 0xff, 0xfe, 'k'} // NUL, LF, invalid UTF-8
+	msg := Message{
+		Key:       key,
+		Value:     []byte("data"),
+		Topic:     "t",
+		Partition: 1,
+		Offset:    7,
+		Timestamp: time.Now(),
+	}
+
+	e := kafkaMessageToEvent(msg, "broker:9092")
+
+	if err := e.Validate(); err != nil {
+		t.Fatalf("event with binary key failed Validate(): %v", err)
+	}
+	if e.Subject() != "" {
+		t.Errorf("subject = %q, want empty for a non-header-safe key", e.Subject())
+	}
+	want := base64.StdEncoding.EncodeToString(key)
+	if got := fmt.Sprintf("%v", e.Extensions()["kafkakey"]); got != want {
+		t.Errorf("kafkakey = %v, want %v (base64)", got, want)
 	}
 }
 
