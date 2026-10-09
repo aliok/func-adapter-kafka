@@ -222,8 +222,13 @@ func TestKafkaMessageToEvent_CEPassThrough_DefaultContentType(t *testing.T) {
 
 	e := kafkaMessageToEvent(msg, "b:9092")
 
-	if e.DataContentType() != "application/json" {
-		t.Errorf("default content type = %q, want application/json", e.DataContentType())
+	// No content-type/ce_datacontenttype header was supplied, so the adapter must
+	// not invent one: datacontenttype stays absent while the data is preserved.
+	if e.DataContentType() != "" {
+		t.Errorf("content type = %q, want empty (no header supplied)", e.DataContentType())
+	}
+	if string(e.Data()) != `{}` {
+		t.Errorf("data = %q, want {}", string(e.Data()))
 	}
 }
 

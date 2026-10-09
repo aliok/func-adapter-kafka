@@ -338,7 +338,11 @@ func parseCEFromHeaders(msg Message) (event.Event, bool) {
 		e.SetDataSchema(v)
 	}
 
-	contentType := "application/json"
+	// Only set a data content type when the record actually carries one. Inventing
+	// a default (e.g. "application/json") would stamp a datacontenttype onto a
+	// pass-through event that legitimately has none, misrepresenting the payload.
+	// With no content type, SetData leaves the attribute absent.
+	contentType := ""
 	if v, ok := headers["content-type"]; ok {
 		contentType = v
 	}

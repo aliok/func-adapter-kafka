@@ -97,6 +97,16 @@ func waitForTarget(target string, timeout time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("invalid FUNCTION_TARGET %q: %w", target, err)
 	}
+	// Require an absolute http(s) URL with a host. url.Parse accepts a bare word
+	// ("myfunc") as a relative URL with an empty host, which would otherwise
+	// silently resolve to probing ":80" on localhost instead of failing fast on a
+	// misconfiguration.
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid FUNCTION_TARGET %q: must be an absolute http or https URL", target)
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("invalid FUNCTION_TARGET %q: missing host", target)
+	}
 
 	host := u.Host
 	if u.Port() == "" {

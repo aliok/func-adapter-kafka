@@ -23,7 +23,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -141,17 +140,15 @@ func (s *Service) Alive(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleSignals() {
+	// Only intercept the termination signals we act on. Passing no signals to
+	// signal.Notify would capture every catchable signal and suppress the default
+	// behavior of ones we do not handle (e.g. SIGHUP, SIGQUIT).
 	sigs := make(chan os.Signal, 2)
-	signal.Notify(sigs)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		for {
-			sig := <-sigs
-			if sig == syscall.SIGINT || sig == syscall.SIGTERM {
-				log.Debug().Any("signal", sig).Msg("signal received")
-				s.sendStop(nil)
-			} else if runtime.GOOS == "linux" && sig == syscall.Signal(0x17) {
-				// Ignore SIGURG
-			}
+		for sig := range sigs {
+			log.Debug().Any("signal", sig).Msg("signal received")
+			s.sendStop(nil)
 		}
 	}()
 }
