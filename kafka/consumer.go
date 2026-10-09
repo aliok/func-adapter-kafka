@@ -302,16 +302,10 @@ func parseCEFromHeaders(msg Message) (event.Event, bool) {
 		headers[strings.ToLower(h.Key)] = string(h.Value)
 	}
 
-	// A binary-mode CloudEvent requires all four mandatory context attributes
-	// (specversion, id, source, type). Treat the record as a pass-through CE only
-	// when every one is present; a record carrying ce_specversion but missing any
-	// of the others is a malformed/partial CE that would fail outbound validation
-	// on every encode and wedge the partition. In that case return false so the
-	// caller wraps it as a fresh event instead.
-	for _, h := range []string{"ce_specversion", "ce_id", "ce_source", "ce_type"} {
-		if _, ok := headers[h]; !ok {
-			return event.Event{}, false
-		}
+	// ce_specversion is the signal that the record is meant to be a CloudEvent at
+	// all; without it, treat the payload as a plain Kafka record and wrap it.
+	if _, ok := headers["ce_specversion"]; !ok {
+		return event.Event{}, false
 	}
 
 	e := event.New()
@@ -362,6 +356,16 @@ func parseCEFromHeaders(msg Message) (event.Event, bool) {
 				e.SetExtension(attr, v)
 			}
 		}
+	}
+
+	// Header presence alone does not guarantee a deliverable CloudEvent: an empty
+	// ce_id, an unsupported ce_specversion, an invalid datacontenttype, etc. are
+	// retained as field errors that fail outbound validation on every encode and
+	// wedge the partition. Validate the completed event and fall back to wrapping
+	// (return false) when it is malformed, so a bad "CloudEvent" record is still
+	// delivered as a plain wrapped event rather than looping forever.
+	if err := e.Validate(); err != nil {
+		return event.Event{}, false
 	}
 
 	return e, true

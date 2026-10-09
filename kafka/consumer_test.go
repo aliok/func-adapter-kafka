@@ -359,6 +359,56 @@ func TestKafkaMessageToEvent_CEPassThrough_Complete(t *testing.T) {
 	}
 }
 
+// TestKafkaMessageToEvent_CEPassThrough_MalformedWrapped verifies that a record
+// which has all four mandatory ce_ headers present but malformed (empty ce_id,
+// unsupported ce_specversion) is NOT passed through: it would fail outbound
+// validation on every encode and wedge the partition. Such records must fall
+// through to the wrap path and emerge as fresh, valid events.
+func TestKafkaMessageToEvent_CEPassThrough_MalformedWrapped(t *testing.T) {
+	cases := map[string][]Header{
+		"empty ce_id": {
+			{Key: "ce_specversion", Value: []byte("1.0")},
+			{Key: "ce_id", Value: []byte("")},
+			{Key: "ce_source", Value: []byte("/s")},
+			{Key: "ce_type", Value: []byte("t")},
+		},
+		"unsupported ce_specversion": {
+			{Key: "ce_specversion", Value: []byte("0.1")},
+			{Key: "ce_id", Value: []byte("x")},
+			{Key: "ce_source", Value: []byte("/s")},
+			{Key: "ce_type", Value: []byte("t")},
+		},
+	}
+
+	for name, headers := range cases {
+		t.Run(name, func(t *testing.T) {
+			msg := Message{
+				Value:     []byte("data"),
+				Topic:     "events",
+				Headers:   headers,
+				Partition: 3,
+				Offset:    9,
+			}
+
+			e := kafkaMessageToEvent(msg, "b:9092")
+
+			if err := e.Validate(); err != nil {
+				t.Fatalf("wrapped event failed Validate(): %v", err)
+			}
+			// The wrap path is identifiable by its generated id/type.
+			if e.ID() != "partition:3/offset:9" {
+				t.Errorf("id = %q, want partition:3/offset:9 (wrapped, not passed through)", e.ID())
+			}
+			if e.Type() != "dev.knative.kafka.event" {
+				t.Errorf("type = %q, want dev.knative.kafka.event (wrapped)", e.Type())
+			}
+			if e.SpecVersion() != "1.0" {
+				t.Errorf("specversion = %q, want 1.0 (wrapped)", e.SpecVersion())
+			}
+		})
+	}
+}
+
 // stubAdapter is a no-op KafkaAdapter used in consume tests.
 // consume fails on env-var validation before it ever calls the adapter.
 type stubAdapter struct{}
