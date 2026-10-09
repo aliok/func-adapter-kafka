@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -251,7 +252,13 @@ func kafkaMessageToEvent(msg Message, brokers string) event.Event {
 	_ = e.SetData("application/octet-stream", msg.Value)
 	e.SetExtension("kafkatopic", msg.Topic)
 	e.SetExtension("kafkapartition", msg.Partition)
-	e.SetExtension("kafkaoffset", msg.Offset)
+	// Kafka offsets are int64, but the CloudEvents Integer attribute type is
+	// 32-bit. An offset past math.MaxInt32 (~2.1B, reached by long-lived
+	// high-volume partitions) is rejected client-side on every binary-mode
+	// encode, so with at-least-once redelivery it would wedge the partition
+	// forever. Store it as a decimal string instead; the full offset is also in
+	// the event ID, so no information is lost.
+	e.SetExtension("kafkaoffset", strconv.FormatInt(msg.Offset, 10))
 	if len(msg.Key) > 0 {
 		e.SetExtension("kafkakey", string(msg.Key))
 	}

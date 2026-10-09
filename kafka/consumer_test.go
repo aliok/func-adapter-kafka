@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -76,6 +77,32 @@ func TestKafkaMessageToEvent(t *testing.T) {
 	}
 	if exts["kafkakey"] != "my-key" {
 		t.Errorf("kafkakey = %v", exts["kafkakey"])
+	}
+}
+
+// TestKafkaMessageToEvent_LargeOffset guards against the int32 CloudEvents
+// Integer ceiling: a Kafka offset past math.MaxInt32 must survive as a decimal
+// string, and the resulting event must validate (i.e. encode client-side).
+// Storing the raw int64 would fail Validate() with "cannot convert ... to
+// int32: out of range" and wedge the partition under at-least-once redelivery.
+func TestKafkaMessageToEvent_LargeOffset(t *testing.T) {
+	const bigOffset int64 = 1<<31 + 5 // 2147483653, just past math.MaxInt32
+	msg := Message{
+		Value:     []byte("data"),
+		Topic:     "t",
+		Partition: 0,
+		Offset:    bigOffset,
+		Timestamp: time.Now(),
+	}
+
+	e := kafkaMessageToEvent(msg, "broker:9092")
+
+	if err := e.Validate(); err != nil {
+		t.Fatalf("event with large offset failed Validate(): %v", err)
+	}
+	want := strconv.FormatInt(bigOffset, 10)
+	if got := fmt.Sprintf("%v", e.Extensions()["kafkaoffset"]); got != want {
+		t.Errorf("kafkaoffset = %v, want %v", got, want)
 	}
 }
 
