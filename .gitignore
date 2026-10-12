@@ -1,0 +1,5 @@
+/fkafka-runtime
+/out/
+/bin/
+*.out
+*.test
