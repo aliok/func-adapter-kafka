@@ -1,8 +1,12 @@
 # func-kafka-adapter — build and test the standalone Kafka runtime.
 
-IMAGE ?= func-kafka-adapter:dev
 BINDIR := bin
 BINARY := $(BINDIR)/fkafka-runtime
+
+# Container images are built with ko (see .ko.yaml), which cross-compiles the
+# static Go binary and pins a non-root base. KO_DOCKER_REPO selects the
+# destination; it defaults to ko.local for a local-only build.
+KO_DOCKER_REPO ?= ko.local
 
 .PHONY: all build test vet fmt check image clean
 
@@ -27,9 +31,9 @@ fmt:
 ## check: fmt + vet + test
 check: fmt vet test
 
-## image: build the container image
+## image: build the container image with ko into $(KO_DOCKER_REPO)
 image:
-	docker build -t $(IMAGE) .
+	KO_DOCKER_REPO=$(KO_DOCKER_REPO) ko build --bare ./cmd/fkafka-runtime
 
 ## clean: remove build artifacts
 clean:

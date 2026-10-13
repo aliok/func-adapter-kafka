@@ -1,0 +1,32 @@
+# Copyright 2026 The Knative Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The Kafka runtime ships as a single container image that func injects as a
+# sidecar next to the user's function; there is no standalone Deployment. This
+# ConfigMap exists so the release pipeline has a resolvable artifact: on release
+# `ko resolve` rewrites the ko:// reference below to the published image digest,
+# which both publishes the image and records a signed, pinned reference in the
+# release artifact. This mirrors how Knative Serving publishes its queue-proxy
+# sidecar image (config/core/configmaps/deployment.yaml: queue-sidecar-image).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: func-kafka-runtime-image
+  labels:
+    app.kubernetes.io/name: func-adapter-kafka
+    app.kubernetes.io/component: kafka-runtime
+data:
+  # Published image reference for the language-agnostic Kafka runtime. Consumers
+  # (e.g. func) read the released digest from here instead of hard-coding a tag.
+  runtime-image: ko://knative.dev/func-adapter-kafka/cmd/fkafka-runtime

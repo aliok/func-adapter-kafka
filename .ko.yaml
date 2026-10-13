@@ -1,0 +1,14 @@
+# ko build configuration for the func-adapter-kafka runtime image.
+#
+# Pin a non-root base so the published image runs as the numeric uid 65532.
+# Kubernetes cannot verify a non-numeric image user and refuses to start such a
+# container under runAsNonRoot: true (CreateContainerConfigError), so the base
+# MUST set a numeric non-root user (distroless "nonroot" is 65532). This mirrors
+# the retired Dockerfile, which pinned the same base for the same reason.
+defaultBaseImage: gcr.io/distroless/static:nonroot
+
+# Publish a multi-arch image. The runtime is a pure-Go static binary, so ko can
+# cross-compile without QEMU.
+defaultPlatforms:
+  - linux/amd64
+  - linux/arm64
