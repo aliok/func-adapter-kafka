@@ -45,6 +45,15 @@ type Service struct {
 	stop          chan error
 	ready         atomic.Bool
 	cancelConsume context.CancelFunc
+	// consumeDone is closed when the consumer goroutine has fully returned (and
+	// therefore its deferred client.Close() has committed final offsets and left
+	// the consumer group). shutdown waits on it so the process does not exit
+	// mid-delivery or before a clean group close.
+	consumeDone chan struct{}
+	// shutdownTimeout bounds how long shutdown waits for the consumer to stop and
+	// the health server to close. Defaults to ServerShutdownTimeout; overridable
+	// in tests.
+	shutdownTimeout time.Duration
 }
 
 // New creates a Service that delivers records to a function running as its own
@@ -59,8 +68,9 @@ func New(target string) (*Service, error) {
 
 func newService(adapter KafkaAdapter) *Service {
 	svc := &Service{
-		adapter: adapter,
-		stop:    make(chan error, 1),
+		adapter:         adapter,
+		stop:            make(chan error, 1),
+		shutdownTimeout: ServerShutdownTimeout,
 		Server: http.Server{
 			ReadTimeout:       30 * time.Second,
 			WriteTimeout:      30 * time.Second,
@@ -97,7 +107,11 @@ func (s *Service) Start(ctx context.Context) (err error) {
 
 	consumerCtx, cancelConsume := context.WithCancel(ctx)
 	s.cancelConsume = cancelConsume
+	s.consumeDone = make(chan struct{})
 	go func() {
+		// Close consumeDone last (after any sendStop) so a waiter in shutdown only
+		// unblocks once consume has fully returned and run its deferred cleanup.
+		defer close(s.consumeDone)
 		if err := consume(consumerCtx, s.adapter, &s.ready); err != nil {
 			log.Error().Err(err).Msg("kafka consumer exited with error")
 			s.sendStop(err)
@@ -166,11 +180,29 @@ func (s *Service) shutdown(sourceErr error) error {
 		s.cancelConsume()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), ServerShutdownTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
 	defer cancel()
+
+	// Wait for the consumer goroutine to return before exiting. Cancelling its
+	// context (above) only signals it to stop; its deferred client.Close() — which
+	// commits the final offsets and leaves the consumer group cleanly — runs as it
+	// unwinds. Without this join the process could exit first, dropping an
+	// in-flight delivery or skipping the clean group close. The wait shares the
+	// shutdown deadline so a wedged in-flight delivery cannot block exit beyond
+	// the shutdown timeout.
+	var consumeErr error
+	if s.consumeDone != nil {
+		select {
+		case <-s.consumeDone:
+		case <-ctx.Done():
+			consumeErr = fmt.Errorf("kafka consumer did not stop within %s: %w", s.shutdownTimeout, ctx.Err())
+			log.Warn().Dur("timeout", s.shutdownTimeout).Msg("kafka consumer did not stop in time; forcing shutdown")
+		}
+	}
+
 	runtimeErr := s.Shutdown(ctx)
 
-	return collapseErrors("shutdown error", sourceErr, runtimeErr)
+	return collapseErrors("shutdown error", sourceErr, consumeErr, runtimeErr)
 }
 
 func listenAddress() string {
