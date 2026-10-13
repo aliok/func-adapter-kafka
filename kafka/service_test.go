@@ -19,7 +19,9 @@ package kafka
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func newTestService(t *testing.T) *Service {
@@ -57,6 +59,58 @@ func TestReady_Ready(t *testing.T) {
 	}
 	if w.Body.String() != "READY" {
 		t.Errorf("expected body %q, got %q", "READY", w.Body.String())
+	}
+}
+
+// TestShutdown_WaitsForConsumer verifies shutdown joins the consumer goroutine:
+// it must not return until consumeDone is closed (which, in the real service,
+// happens only after the consumer's deferred client.Close() commits offsets and
+// leaves the group). Without the join, shutdown would return as soon as it
+// cancelled the context and the process could exit mid-cleanup.
+func TestShutdown_WaitsForConsumer(t *testing.T) {
+	svc := newTestService(t)
+	svc.consumeDone = make(chan struct{})
+
+	var finished atomic.Bool
+	// Simulate a consumer that, once signalled to stop, takes a moment to run its
+	// cleanup before closing consumeDone.
+	svc.cancelConsume = func() {
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			finished.Store(true)
+			close(svc.consumeDone)
+		}()
+	}
+
+	if err := svc.shutdown(nil); err != nil {
+		t.Fatalf("shutdown returned error: %v", err)
+	}
+	if !finished.Load() {
+		t.Fatal("shutdown returned before the consumer goroutine finished (no join)")
+	}
+}
+
+// TestShutdown_TimesOutOnStuckConsumer verifies the join is bounded: a consumer
+// that never stops (e.g. wedged on an in-flight delivery) must not block exit
+// forever. shutdown waits up to shutdownTimeout, then returns an error.
+func TestShutdown_TimesOutOnStuckConsumer(t *testing.T) {
+	svc := newTestService(t)
+	svc.consumeDone = make(chan struct{}) // never closed: the consumer is wedged
+	svc.cancelConsume = func() {}         // stop signal ignored
+	svc.shutdownTimeout = 50 * time.Millisecond
+
+	start := time.Now()
+	err := svc.shutdown(nil)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected a shutdown error when the consumer does not stop in time")
+	}
+	if elapsed < svc.shutdownTimeout {
+		t.Errorf("shutdown returned after %s, before the %s timeout elapsed", elapsed, svc.shutdownTimeout)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("shutdown took %s; the timeout was not honored", elapsed)
 	}
 }
 
