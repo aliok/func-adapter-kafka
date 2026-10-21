@@ -409,6 +409,71 @@ func TestKafkaMessageToEvent_CEPassThrough_MalformedWrapped(t *testing.T) {
 	}
 }
 
+// TestKafkaMessageToEvent_CEPassThrough_UnsafeHeaderWrapped verifies that a
+// record whose ce_* headers form a CloudEvent that passes Validate() but carries
+// a control character (CR, LF, NUL) or invalid UTF-8 in an attribute value is NOT
+// passed through: the binary HTTP encoder would reject it on every encode and
+// wedge the partition. Such records must fall back to the wrap path and emerge as
+// fresh, valid, header-safe events.
+func TestKafkaMessageToEvent_CEPassThrough_UnsafeHeaderWrapped(t *testing.T) {
+	base := func() []Header {
+		return []Header{
+			{Key: "ce_specversion", Value: []byte("1.0")},
+			{Key: "ce_id", Value: []byte("evt-1")},
+			{Key: "ce_source", Value: []byte("/s")},
+			{Key: "ce_type", Value: []byte("t")},
+		}
+	}
+	cases := map[string]Header{
+		"CR in subject":         {Key: "ce_subject", Value: []byte("a\rb")},
+		"LF in subject":         {Key: "ce_subject", Value: []byte("a\nb")},
+		"NUL in subject":        {Key: "ce_subject", Value: []byte("a\x00b")},
+		"invalid UTF-8 subject": {Key: "ce_subject", Value: []byte{'a', 0xff, 0xfe}},
+		"control in extension":  {Key: "ce_myext", Value: []byte("bad\nvalue")},
+	}
+
+	for name, bad := range cases {
+		t.Run(name, func(t *testing.T) {
+			headers := base()
+			// ce_source/ce_subject may already exist in base(); override or append.
+			replaced := false
+			for i := range headers {
+				if headers[i].Key == bad.Key {
+					headers[i] = bad
+					replaced = true
+				}
+			}
+			if !replaced {
+				headers = append(headers, bad)
+			}
+			msg := Message{
+				Value:     []byte("data"),
+				Topic:     "events",
+				Headers:   headers,
+				Partition: 3,
+				Offset:    9,
+			}
+
+			e := kafkaMessageToEvent(msg, "b:9092")
+
+			if err := e.Validate(); err != nil {
+				t.Fatalf("wrapped event failed Validate(): %v", err)
+			}
+			// The wrap path is identifiable by its generated id/type.
+			if e.ID() != "partition:3/offset:9" {
+				t.Errorf("id = %q, want partition:3/offset:9 (wrapped, not passed through)", e.ID())
+			}
+			if e.Type() != "dev.knative.kafka.event" {
+				t.Errorf("type = %q, want dev.knative.kafka.event (wrapped)", e.Type())
+			}
+			// The wrapped event must itself be header-safe.
+			if !eventHeaderSafe(e) {
+				t.Errorf("wrapped event is not header-safe: %+v", e)
+			}
+		})
+	}
+}
+
 // stubAdapter is a no-op KafkaAdapter used in consume tests.
 // consume fails on env-var validation before it ever calls the adapter.
 type stubAdapter struct{}

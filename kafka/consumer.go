@@ -277,17 +277,50 @@ func kafkaMessageToEvent(msg Message, brokers string) event.Event {
 	return e
 }
 
-// keyHeaderSafe reports whether key can be carried verbatim as a CloudEvents
+// stringHeaderSafe reports whether s can be carried verbatim as a CloudEvents
 // string attribute / HTTP header value: it must be valid UTF-8 with no control
 // characters (CR, LF, NUL, etc.), which net/http and CloudEvents string
-// validation would otherwise reject.
-func keyHeaderSafe(key []byte) bool {
-	s := string(key)
+// validation would otherwise reject. The check is intentionally stricter than
+// net/http (which tolerates HTAB) so a rejected value always falls back to the
+// safe wrap path rather than wedging the partition on every encode attempt.
+func stringHeaderSafe(s string) bool {
 	if !utf8.ValidString(s) {
 		return false
 	}
 	for _, r := range s {
 		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// keyHeaderSafe reports whether the Kafka key can be carried verbatim as a
+// CloudEvents string attribute / HTTP header value.
+func keyHeaderSafe(key []byte) bool {
+	return stringHeaderSafe(string(key))
+}
+
+// eventHeaderSafe reports whether every string attribute of e that the binary
+// HTTP encoder writes out as a header can be carried safely. A pass-through
+// CloudEvent copies ce_* header values straight into attributes, and those
+// values can contain bytes (CR, LF, NUL) that pass CloudEvents validation but
+// are rejected by net/http on every binary-mode encode -- wedging the partition
+// under at-least-once redelivery. Checking the values here lets the caller fall
+// back to wrapping instead.
+func eventHeaderSafe(e event.Event) bool {
+	for _, s := range []string{
+		e.ID(), e.Source(), e.Type(), e.Subject(), e.DataSchema(), e.DataContentType(),
+	} {
+		if !stringHeaderSafe(s) {
+			return false
+		}
+	}
+	// Extensions are written as Ce-<name> headers too. Only string-valued
+	// extensions can carry unsafe bytes; non-string types (e.g. the wrap path's
+	// integer kafkapartition) are rendered to safe text by the encoder.
+	for _, v := range e.Extensions() {
+		if s, ok := v.(string); ok && !stringHeaderSafe(s) {
 			return false
 		}
 	}
@@ -365,6 +398,16 @@ func parseCEFromHeaders(msg Message) (event.Event, bool) {
 	// (return false) when it is malformed, so a bad "CloudEvent" record is still
 	// delivered as a plain wrapped event rather than looping forever.
 	if err := e.Validate(); err != nil {
+		return event.Event{}, false
+	}
+
+	// Validation passes non-empty strings but does not reject control characters
+	// (CR, LF, NUL) embedded in attribute values copied from the ce_* headers.
+	// The binary HTTP encoder does reject them, on every encode, so such a record
+	// would wedge the partition forever. Fall back to wrapping (return false) so
+	// it is still delivered as a plain wrapped event -- the same fail-closed
+	// behavior the wrap path already applies to an unsafe Kafka key.
+	if !eventHeaderSafe(e) {
 		return event.Event{}, false
 	}
 
