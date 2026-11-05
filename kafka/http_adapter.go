@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	nethttp "net/http"
-	"os"
 	"strconv"
 	"time"
 
@@ -115,8 +114,8 @@ func newHTTPAdapter(target string) (*httpAdapter, error) {
 // requestTimeout returns the per-attempt delivery timeout, honoring the
 // FUNCTION_REQUEST_TIMEOUT override.
 func requestTimeout() (time.Duration, error) {
-	v, ok := os.LookupEnv("FUNCTION_REQUEST_TIMEOUT")
-	if !ok || v == "" {
+	v, ok := lookupNonEmptyEnv("FUNCTION_REQUEST_TIMEOUT")
+	if !ok {
 		return DefaultRequestTimeout, nil
 	}
 	d, err := time.ParseDuration(v)
@@ -132,8 +131,8 @@ func requestTimeout() (time.Duration, error) {
 // maxConcurrency returns the maximum number of concurrent in-flight deliveries,
 // honoring the FUNCTION_MAX_CONCURRENCY override. 0 means unbounded.
 func maxConcurrency() (int, error) {
-	v, ok := os.LookupEnv("FUNCTION_MAX_CONCURRENCY")
-	if !ok || v == "" {
+	v, ok := lookupNonEmptyEnv("FUNCTION_MAX_CONCURRENCY")
+	if !ok {
 		return DefaultMaxConcurrency, nil
 	}
 	n, err := strconv.Atoi(v)

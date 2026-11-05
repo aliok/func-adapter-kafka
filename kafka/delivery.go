@@ -163,29 +163,48 @@ func loadDeliveryConfig() (deliveryConfig, error) {
 		}
 	}
 
+	baseDelaySet := false
 	if v, ok := lookupNonEmptyEnv("FUNCTION_DELIVERY_BACKOFF_DELAY"); ok {
 		d, err := parseNonNegativeDuration("FUNCTION_DELIVERY_BACKOFF_DELAY", v)
 		if err != nil {
 			return deliveryConfig{}, err
 		}
 		c.baseDelay = d
+		baseDelaySet = true
 	}
 
+	maxDelaySet := false
 	if v, ok := lookupNonEmptyEnv("FUNCTION_DELIVERY_BACKOFF_MAX_DELAY"); ok {
 		d, err := parseNonNegativeDuration("FUNCTION_DELIVERY_BACKOFF_MAX_DELAY", v)
 		if err != nil {
 			return deliveryConfig{}, err
 		}
 		c.maxDelay = d
+		maxDelaySet = true
 	}
 
 	// A max below the base would silently clamp every delay to the base; reject
-	// it so the configuration is unambiguous.
+	// it so the configuration is unambiguous. Either value may come from a
+	// default (the common case is setting only the base and tripping over the
+	// 30s default max), so the message flags which side is a default rather than
+	// pointing the user at a variable they never set.
 	if c.maxDelay < c.baseDelay {
-		return deliveryConfig{}, fmt.Errorf("FUNCTION_DELIVERY_BACKOFF_MAX_DELAY (%s) must be >= FUNCTION_DELIVERY_BACKOFF_DELAY (%s)", c.maxDelay, c.baseDelay)
+		return deliveryConfig{}, fmt.Errorf("%s must be >= %s",
+			describeDelayValue("FUNCTION_DELIVERY_BACKOFF_MAX_DELAY", c.maxDelay, maxDelaySet),
+			describeDelayValue("FUNCTION_DELIVERY_BACKOFF_DELAY", c.baseDelay, baseDelaySet))
 	}
 
 	return c, nil
+}
+
+// describeDelayValue renders a delay for the max/base validation error, noting
+// when the value is the built-in default rather than one the user supplied, so
+// the error never tells the user to raise or lower a variable they never set.
+func describeDelayValue(envName string, d time.Duration, fromEnv bool) string {
+	if fromEnv {
+		return fmt.Sprintf("%s (%s)", envName, d)
+	}
+	return fmt.Sprintf("%s (default %s, unset)", envName, d)
 }
 
 // lookupNonEmptyEnv returns the trimmed value of an environment variable and

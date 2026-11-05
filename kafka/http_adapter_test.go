@@ -117,7 +117,9 @@ func TestRequestTimeout(t *testing.T) {
 	}{
 		{name: "unset uses default", set: false, want: DefaultRequestTimeout},
 		{name: "empty uses default", set: true, value: "", want: DefaultRequestTimeout},
+		{name: "blank uses default", set: true, value: "   ", want: DefaultRequestTimeout},
 		{name: "custom duration", set: true, value: "45s", want: 45 * time.Second},
+		{name: "padded duration trimmed", set: true, value: "  45s  ", want: 45 * time.Second},
 		{name: "zero disables", set: true, value: "0", want: 0},
 		{name: "invalid", set: true, value: "banana", wantErr: true},
 		{name: "negative", set: true, value: "-5s", wantErr: true},

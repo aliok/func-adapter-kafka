@@ -17,6 +17,7 @@ limitations under the License.
 package kafka
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -115,6 +116,26 @@ func TestLoadDeliveryConfig_ZeroRetry(t *testing.T) {
 	}
 	if c.maxAttempts() != 1 {
 		t.Errorf("maxAttempts() = %d; want 1", c.maxAttempts())
+	}
+}
+
+// When only the base delay is set and it exceeds the 30s default max, the
+// validation error must flag the max as an unset default rather than naming a
+// variable the operator never set.
+func TestLoadDeliveryConfig_MaxBelowBaseNamesDefault(t *testing.T) {
+	clearDeliveryEnv(t)
+	t.Setenv("FUNCTION_DELIVERY_BACKOFF_DELAY", "60s") // max defaults to 30s
+
+	_, err := loadDeliveryConfig()
+	if err == nil {
+		t.Fatal("loadDeliveryConfig accepted base (60s) above the default max (30s); want error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "FUNCTION_DELIVERY_BACKOFF_MAX_DELAY (default 30s, unset)") {
+		t.Errorf("error should flag the max as an unset default; got: %v", err)
+	}
+	if !strings.Contains(msg, "FUNCTION_DELIVERY_BACKOFF_DELAY (1m0s)") {
+		t.Errorf("error should name the base as a set value; got: %v", err)
 	}
 }
 
