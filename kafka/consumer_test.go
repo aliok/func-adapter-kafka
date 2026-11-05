@@ -655,7 +655,7 @@ func TestConsume_MissingEnvVars(t *testing.T) {
 			}
 
 			var ready atomic.Bool
-			err := consume(context.Background(), stubAdapter{}, &ready)
+			err := consume(context.Background(), stubAdapter{}, &ready, defaultDeliveryConfig())
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}

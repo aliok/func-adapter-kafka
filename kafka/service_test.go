@@ -338,6 +338,40 @@ func TestStart_ReturnsErrorOnTargetTimeout(t *testing.T) {
 	}
 }
 
+// TestStart_FailsFastOnInvalidDeliveryConfig verifies a malformed FUNCTION_DELIVERY_*
+// value is rejected at process startup, before the function-target wait -- so a bad
+// value is not masked by (and reported only after) a target-wait timeout when the
+// function is slow to start or unavailable. The target points at a refused port with
+// a long wait timeout; Start must return the delivery-config error well before that
+// timeout could elapse.
+func TestStart_FailsFastOnInvalidDeliveryConfig(t *testing.T) {
+	t.Setenv("LISTEN_ADDRESS", "127.0.0.1:0")
+	t.Setenv("FUNCTION_DELIVERY_RETRY", "not-a-number")
+
+	svc := newService(stubAdapter{})
+	svc.target = refusedTarget(t)
+	svc.targetWaitTimeout = 30 * time.Second // long: the test must not wait this out
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Start accepted an invalid FUNCTION_DELIVERY_RETRY; want an error")
+		}
+		if !strings.Contains(err.Error(), "configuring delivery") {
+			t.Errorf("expected a delivery-config error, got: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("Start took %s to reject bad config; it should fail before the %s target wait", elapsed, svc.targetWaitTimeout)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start did not fail fast on invalid delivery config; it appears to be waiting for the target")
+	}
+}
+
 // TestStart_ReturnsNilOnStopDuringWait verifies the SIGTERM path: a clean stop
 // signalled while Start is still waiting for the target returns nil, joining the
 // wait goroutine through shutdown rather than treating the stop as a failure.

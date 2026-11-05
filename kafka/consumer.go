@@ -64,7 +64,7 @@ func splitAndTrim(s string) []string {
 // consume runs the Kafka consumer, delivering each record (converted to a
 // CloudEvent) through the given KafkaAdapter. The offset is committed only when
 // the adapter returns a nil error.
-func consume(ctx context.Context, adapter KafkaAdapter, ready *atomic.Bool) error {
+func consume(ctx context.Context, adapter KafkaAdapter, ready *atomic.Bool, deliveryCfg deliveryConfig) error {
 	defer ready.Store(false)
 
 	brokers := kafkaBrokers()
@@ -81,12 +81,9 @@ func consume(ctx context.Context, adapter KafkaAdapter, ready *atomic.Bool) erro
 		return fmt.Errorf("KAFKA_CONSUMER_GROUP environment variable is required")
 	}
 
-	// Parse delivery retry config up front so a bad value fails fast at startup
-	// rather than after connecting to the broker.
-	deliveryCfg, err := loadDeliveryConfig()
-	if err != nil {
-		return fmt.Errorf("configuring delivery: %w", err)
-	}
+	// deliveryCfg is parsed and validated by the caller before the function-target
+	// wait, so a malformed FUNCTION_DELIVERY_* value fails at process startup
+	// rather than being masked by a target-wait timeout.
 	retries := "unlimited"
 	if !deliveryCfg.unlimited() {
 		retries = strconv.Itoa(deliveryCfg.retry)
