@@ -17,14 +17,20 @@ limitations under the License.
 package kafka
 
 import (
+	"fmt"
+	"math"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
 // Unset every FUNCTION_DELIVERY_* variable for the duration of a test so the
-// environment of the test runner cannot leak in. t.Setenv restores them on
-// cleanup.
+// environment of the test runner cannot leak in. t.Setenv registers the
+// restore-on-cleanup; os.Unsetenv then actually removes it for the test body, so
+// the variable is genuinely absent (not present-but-empty, which is now a startup
+// error for FUNCTION_DELIVERY_RETRY).
 func clearDeliveryEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
@@ -34,6 +40,7 @@ func clearDeliveryEnv(t *testing.T) {
 		"FUNCTION_DELIVERY_BACKOFF_MAX_DELAY",
 	} {
 		t.Setenv(name, "")
+		os.Unsetenv(name)
 	}
 }
 
@@ -63,17 +70,35 @@ func TestLoadDeliveryConfig_Defaults(t *testing.T) {
 	}
 }
 
-// A blank value is treated as unset and falls back to the default.
-func TestLoadDeliveryConfig_BlankIsDefault(t *testing.T) {
+// A present-but-empty FUNCTION_DELIVERY_RETRY is a startup error: unlimited must
+// be expressed by OMITTING the variable, so an empty templated value cannot
+// silently re-enable unbounded delivery.
+func TestLoadDeliveryConfig_EmptyRetryIsError(t *testing.T) {
+	for _, v := range []string{"", "   "} {
+		t.Run(fmt.Sprintf("value=%q", v), func(t *testing.T) {
+			clearDeliveryEnv(t)
+			t.Setenv("FUNCTION_DELIVERY_RETRY", v)
+
+			if _, err := loadDeliveryConfig(); err == nil {
+				t.Errorf("empty FUNCTION_DELIVERY_RETRY %q should be an error, not a silent unlimited default", v)
+			}
+		})
+	}
+}
+
+// The benign variables deliberately keep their empty-is-default leniency (only
+// RETRY is strict, because its default is the unbounded mode). A blank base delay
+// falls back to the 100ms default rather than erroring.
+func TestLoadDeliveryConfig_BlankBenignVarIsDefault(t *testing.T) {
 	clearDeliveryEnv(t)
-	t.Setenv("FUNCTION_DELIVERY_RETRY", "   ")
+	t.Setenv("FUNCTION_DELIVERY_BACKOFF_DELAY", "   ")
 
 	c, err := loadDeliveryConfig()
 	if err != nil {
 		t.Fatalf("loadDeliveryConfig: %v", err)
 	}
-	if !c.unlimited() {
-		t.Errorf("blank FUNCTION_DELIVERY_RETRY should keep the unlimited default")
+	if c.baseDelay != 100*time.Millisecond {
+		t.Errorf("baseDelay = %s; want the 100ms default for a blank value", c.baseDelay)
 	}
 }
 
@@ -146,6 +171,7 @@ func TestLoadDeliveryConfig_Invalid(t *testing.T) {
 	}{
 		{"non-numeric retry", map[string]string{"FUNCTION_DELIVERY_RETRY": "lots"}},
 		{"negative retry", map[string]string{"FUNCTION_DELIVERY_RETRY": "-1"}},
+		{"maxint retry overflows budget", map[string]string{"FUNCTION_DELIVERY_RETRY": strconv.Itoa(math.MaxInt)}},
 		{"unknown policy", map[string]string{"FUNCTION_DELIVERY_BACKOFF_POLICY": "fibonacci"}},
 		{"bad delay", map[string]string{"FUNCTION_DELIVERY_BACKOFF_DELAY": "soon"}},
 		{"negative delay", map[string]string{"FUNCTION_DELIVERY_BACKOFF_DELAY": "-1s"}},
@@ -199,6 +225,37 @@ func TestBackoffFor_Linear(t *testing.T) {
 		if got := c.backoffFor(n); got != w {
 			t.Errorf("backoffFor(%d) = %s; want %s", n, got, w)
 		}
+	}
+}
+
+// A 1ns base with a near-maximum cap is a pathological-but-valid config that used
+// to overflow: the linear capN computation (quotient+1) and the exponential
+// doubling could both wrap time.Duration negative, returning the wrong delay (max
+// instead of base, or a negative delay that retries instantly). The math must
+// stay monotonic and never exceed the cap.
+func TestBackoffFor_NoOverflowWithHugeCap(t *testing.T) {
+	// time.ParseDuration's ceiling is math.MaxInt64 ns (~292 years); use it as the
+	// cap with the smallest possible base.
+	hugeCap := time.Duration(math.MaxInt64)
+	for _, p := range []backoffPolicy{backoffLinear, backoffExponential} {
+		t.Run(string(p), func(t *testing.T) {
+			c := deliveryConfig{policy: p, baseDelay: 1, maxDelay: hugeCap}
+
+			// First attempt must return the base delay, not the cap.
+			if got := c.backoffFor(1); got != c.baseDelay {
+				t.Errorf("backoffFor(1) = %s; want the 1ns base delay", got)
+			}
+			// Every delay, including large n, stays within (0, maxDelay].
+			for _, n := range []int{1, 2, 3, 64, 65, 1000, math.MaxInt32} {
+				got := c.backoffFor(n)
+				if got < 0 {
+					t.Errorf("backoffFor(%d) = %s; overflowed negative", n, got)
+				}
+				if got > c.maxDelay {
+					t.Errorf("backoffFor(%d) = %s; exceeds cap %s", n, got, c.maxDelay)
+				}
+			}
+		})
 	}
 }
 

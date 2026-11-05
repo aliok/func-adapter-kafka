@@ -18,6 +18,7 @@ package kafka
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -104,9 +105,11 @@ func (c deliveryConfig) backoffFor(n int) time.Duration {
 
 	switch c.policy {
 	case backoffLinear:
-		// baseDelay * n, capped. Cap n first so a long-stuck partition (large n
-		// under an unlimited budget) cannot overflow the int64 duration.
-		if capN := int(c.maxDelay/c.baseDelay) + 1; n >= capN {
+		// baseDelay * n, capped. Compare n against the quotient maxDelay/baseDelay
+		// (not quotient+1) so the comparison itself cannot overflow for a tiny base
+		// and a huge cap. Once n exceeds that quotient the product would exceed the
+		// cap; below it the product is <= maxDelay and cannot overflow.
+		if q := c.maxDelay / c.baseDelay; time.Duration(n) > q {
 			return c.maxDelay
 		}
 		d := c.baseDelay * time.Duration(n)
@@ -115,14 +118,16 @@ func (c deliveryConfig) backoffFor(n int) time.Duration {
 		}
 		return d
 	default: // exponential
-		// baseDelay * 2^(n-1). Double iteratively and bail out as soon as the
-		// cap is reached, so the doubling cannot overflow for large n.
+		// baseDelay * 2^(n-1), capped. Saturate BEFORE doubling: if the current
+		// delay already exceeds half the cap, the next double would meet or exceed
+		// the cap anyway, so return it without performing a multiplication that
+		// could overflow time.Duration for a tiny base and a huge cap.
 		d := c.baseDelay
 		for i := 1; i < n; i++ {
-			d *= 2
-			if d >= c.maxDelay {
+			if d > c.maxDelay/2 {
 				return c.maxDelay
 			}
+			d *= 2
 		}
 		if d > c.maxDelay {
 			return c.maxDelay
@@ -138,16 +143,34 @@ func (c deliveryConfig) backoffFor(n int) time.Duration {
 func loadDeliveryConfig() (deliveryConfig, error) {
 	c := defaultDeliveryConfig()
 
-	if v, ok := lookupNonEmptyEnv("FUNCTION_DELIVERY_RETRY"); ok {
+	// FUNCTION_DELIVERY_RETRY is read with a bare LookupEnv rather than
+	// lookupNonEmptyEnv -- deliberately stricter than the other variables. Its
+	// default (omitted) means UNLIMITED, the unbounded mode the negative-value
+	// rejection below already guards against. Treating a present-but-empty value
+	// (e.g. an unrendered template FUNCTION_DELIVERY_RETRY=) as "omitted" would
+	// silently re-enable unlimited delivery, so an empty/blank value is a startup
+	// error. The benign variables keep their empty-is-default leniency.
+	if raw, ok := os.LookupEnv("FUNCTION_DELIVERY_RETRY"); ok {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			return deliveryConfig{}, fmt.Errorf("invalid FUNCTION_DELIVERY_RETRY %q: must not be empty (omit the variable for unlimited retries)", raw)
+		}
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return deliveryConfig{}, fmt.Errorf("invalid FUNCTION_DELIVERY_RETRY %q: %w", v, err)
+			return deliveryConfig{}, fmt.Errorf("invalid FUNCTION_DELIVERY_RETRY %q: %w", raw, err)
 		}
 		// A negative env value is rejected: unlimited is expressed by omitting
 		// the variable, not by passing -1, so a typo cannot silently mean
 		// "retry forever".
 		if n < 0 {
-			return deliveryConfig{}, fmt.Errorf("invalid FUNCTION_DELIVERY_RETRY %q: must not be negative (omit the variable for unlimited retries)", v)
+			return deliveryConfig{}, fmt.Errorf("invalid FUNCTION_DELIVERY_RETRY %q: must not be negative (omit the variable for unlimited retries)", raw)
+		}
+		// maxAttempts() computes retry+1; math.MaxInt would overflow to a negative
+		// attempt budget and drop the first failed record. Reject it rather than
+		// silently invert the budget (an effectively-unlimited value this large
+		// should omit the variable anyway).
+		if n == math.MaxInt {
+			return deliveryConfig{}, fmt.Errorf("invalid FUNCTION_DELIVERY_RETRY %q: too large (omit the variable for unlimited retries)", raw)
 		}
 		c.retry = n
 	}
