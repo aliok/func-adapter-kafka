@@ -499,15 +499,26 @@ func (f *flakyAdapter) Invoke(context.Context, event.Event) (*event.Event, error
 	return nil, nil
 }
 
+// fastUnlimitedDelivery is the default (unlimited retries) with a tiny backoff so
+// retry-driven tests do not sleep for the production 100ms→30s schedule.
+func fastUnlimitedDelivery() deliveryConfig {
+	return deliveryConfig{
+		retry:     -1,
+		policy:    backoffExponential,
+		baseDelay: time.Millisecond,
+		maxDelay:  5 * time.Millisecond,
+	}
+}
+
 // deliver retries a transient failure and only marks the offset once delivery
 // succeeds, so a record is never skipped after a blip like a stale keep-alive.
 func TestDeliver_RetriesUntilSuccess(t *testing.T) {
 	fake := &flakyAdapter{failuresLeft: 2}
-	h := &consumerGroupHandler{adapter: fake}
+	h := &consumerGroupHandler{adapter: fake, delivery: fastUnlimitedDelivery()}
 	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
 
-	if ok := h.deliver(context.Background(), msg, event.New()); !ok {
-		t.Fatal("deliver returned false; want true after retries eventually succeed")
+	if out := h.deliver(context.Background(), msg, event.New()); out != deliveredOK {
+		t.Fatalf("deliver returned %v; want deliveredOK after retries eventually succeed", out)
 	}
 	if fake.calls != 3 {
 		t.Errorf("Invoke called %d times, want 3 (2 failures + 1 success)", fake.calls)
@@ -515,26 +526,60 @@ func TestDeliver_RetriesUntilSuccess(t *testing.T) {
 }
 
 // When the session context is cancelled while delivery keeps failing, deliver
-// stops and reports false so the caller does NOT mark the offset (the record is
-// redelivered from the last committed offset in the next session).
+// stops and reports deliveryAborted so the caller does NOT mark the offset (the
+// record is redelivered from the last committed offset in the next session).
 func TestDeliver_StopsOnContextCancel(t *testing.T) {
 	fake := &flakyAdapter{alwaysFail: true}
-	h := &consumerGroupHandler{adapter: fake}
+	h := &consumerGroupHandler{adapter: fake, delivery: fastUnlimitedDelivery()}
 	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	done := make(chan bool, 1)
+	done := make(chan deliveryOutcome, 1)
 	go func() { done <- h.deliver(ctx, msg, event.New()) }()
 
 	select {
-	case ok := <-done:
-		if ok {
-			t.Fatal("deliver returned true on a cancelled context; want false")
+	case out := <-done:
+		if out != deliveryAborted {
+			t.Fatalf("deliver returned %v on a cancelled context; want deliveryAborted", out)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("deliver did not return after context cancellation")
+	}
+}
+
+// With a finite retry budget and a function that always fails, deliver stops
+// after retry+1 total attempts and reports deliveryExhausted so the caller
+// commits the offset (skip-and-commit) instead of wedging the partition.
+func TestDeliver_ExhaustsFiniteRetryBudget(t *testing.T) {
+	fake := &flakyAdapter{alwaysFail: true}
+	cfg := fastUnlimitedDelivery()
+	cfg.retry = 2 // 3 total attempts
+	h := &consumerGroupHandler{adapter: fake, delivery: cfg}
+	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
+
+	if out := h.deliver(context.Background(), msg, event.New()); out != deliveryExhausted {
+		t.Fatalf("deliver returned %v; want deliveryExhausted", out)
+	}
+	if fake.calls != 3 {
+		t.Errorf("Invoke called %d times, want 3 (retry=2 → 3 total attempts)", fake.calls)
+	}
+}
+
+// retry=0 means a single attempt with no retry: a failure exhausts immediately.
+func TestDeliver_ZeroRetriesIsSingleAttempt(t *testing.T) {
+	fake := &flakyAdapter{alwaysFail: true}
+	cfg := fastUnlimitedDelivery()
+	cfg.retry = 0
+	h := &consumerGroupHandler{adapter: fake, delivery: cfg}
+	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
+
+	if out := h.deliver(context.Background(), msg, event.New()); out != deliveryExhausted {
+		t.Fatalf("deliver returned %v; want deliveryExhausted", out)
+	}
+	if fake.calls != 1 {
+		t.Errorf("Invoke called %d times, want 1 (retry=0 → single attempt)", fake.calls)
 	}
 }
 

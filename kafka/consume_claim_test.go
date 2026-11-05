@@ -119,7 +119,7 @@ func (a *capturingAdapter) attemptIDs() []string {
 // consuming -- a mutant that returns after the first record would mark only 42.
 func TestConsumeClaim_MarksOffsetOnSuccess(t *testing.T) {
 	adapter := &capturingAdapter{called: make(chan struct{}, 2)}
-	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092"}
+	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092", delivery: defaultDeliveryConfig()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -165,7 +165,7 @@ func TestConsumeClaim_MarksOffsetOnSuccess(t *testing.T) {
 // would survive (the other tests use records that carry neither).
 func TestConsumeClaim_ConvertsRecordFields(t *testing.T) {
 	adapter := &capturingAdapter{called: make(chan struct{}, 1)}
-	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092"}
+	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092", delivery: defaultDeliveryConfig()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -217,7 +217,7 @@ func TestConsumeClaim_ConvertsRecordFields(t *testing.T) {
 // other test failing.
 func TestConsumeClaim_PassesThroughCloudEventHeaders(t *testing.T) {
 	adapter := &capturingAdapter{called: make(chan struct{}, 1)}
-	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092"}
+	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092", delivery: defaultDeliveryConfig()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -269,7 +269,7 @@ func TestConsumeClaim_PassesThroughCloudEventHeaders(t *testing.T) {
 // up after N tries and advances would be caught: it would attempt 43 and/or mark.
 func TestConsumeClaim_DoesNotMarkOffsetOnFailure(t *testing.T) {
 	adapter := &capturingAdapter{err: errors.New("non-2xx from function"), called: make(chan struct{}, 16)}
-	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092"}
+	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092", delivery: defaultDeliveryConfig()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 

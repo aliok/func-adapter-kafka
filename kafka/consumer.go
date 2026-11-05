@@ -81,6 +81,23 @@ func consume(ctx context.Context, adapter KafkaAdapter, ready *atomic.Bool) erro
 		return fmt.Errorf("KAFKA_CONSUMER_GROUP environment variable is required")
 	}
 
+	// Parse delivery retry config up front so a bad value fails fast at startup
+	// rather than after connecting to the broker.
+	deliveryCfg, err := loadDeliveryConfig()
+	if err != nil {
+		return fmt.Errorf("configuring delivery: %w", err)
+	}
+	retries := "unlimited"
+	if !deliveryCfg.unlimited() {
+		retries = strconv.Itoa(deliveryCfg.retry)
+	}
+	log.Info().
+		Str("retries", retries).
+		Str("backoffPolicy", string(deliveryCfg.policy)).
+		Dur("backoffDelay", deliveryCfg.baseDelay).
+		Dur("backoffMaxDelay", deliveryCfg.maxDelay).
+		Msg("delivery retry configured")
+
 	log.Info().
 		Strs("brokers", brokers).
 		Str("topic", topic).
@@ -109,9 +126,10 @@ func consume(ctx context.Context, adapter KafkaAdapter, ready *atomic.Bool) erro
 	}()
 
 	handler := &consumerGroupHandler{
-		adapter: adapter,
-		ready:   ready,
-		brokers: strings.Join(brokers, ","),
+		adapter:  adapter,
+		ready:    ready,
+		brokers:  strings.Join(brokers, ","),
+		delivery: deliveryCfg,
 	}
 
 	for {
@@ -129,9 +147,10 @@ func consume(ctx context.Context, adapter KafkaAdapter, ready *atomic.Bool) erro
 }
 
 type consumerGroupHandler struct {
-	adapter KafkaAdapter
-	ready   *atomic.Bool
-	brokers string
+	adapter  KafkaAdapter
+	ready    *atomic.Bool
+	brokers  string
+	delivery deliveryConfig
 }
 
 func (h *consumerGroupHandler) Setup(_ sarama.ConsumerGroupSession) error {
@@ -175,16 +194,22 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 			// Deliver with retry. The offset is only marked once delivery
 			// succeeds, so a transient failure (a stale keep-alive connection,
 			// a restarting function, a timeout) is redelivered rather than
-			// skipped — preserving at-least-once. If delivery keeps failing we
-			// keep retrying the same record with backoff, which blocks this
-			// partition until the function recovers; we never advance past an
-			// undelivered record. Redelivery of a genuine poison-pill record is
-			// a known gap (a dead-letter path is future work).
-			if !h.deliver(session.Context(), msg, e) {
+			// skipped — preserving at-least-once. By default retries are
+			// unlimited, so delivery blocks this partition until the function
+			// recovers and we never advance past an undelivered record. When a
+			// finite retry budget is configured and it is exhausted, the record
+			// is skipped and its offset committed so a poison-pill cannot wedge
+			// the partition forever (the record is dropped; dead-letter routing
+			// is future work).
+			switch h.deliver(session.Context(), msg, e) {
+			case deliveryAborted:
 				// Context cancelled (rebalance or shutdown) before delivery
 				// succeeded: stop without marking so the record is redelivered
 				// from the last committed offset in the next session.
 				return nil
+			case deliveryExhausted:
+				// Retry budget used up; the record was logged and is dropped.
+				// Fall through to mark the offset so the partition advances.
 			}
 			session.MarkMessage(msg, "")
 		case <-session.Context().Done():
@@ -193,43 +218,61 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 	}
 }
 
-// Delivery retry backoff bounds. Backoff grows exponentially from base to max;
-// attempts are unbounded but interrupted as soon as the session context is
-// cancelled (rebalance/shutdown).
+// deliveryOutcome is the result of attempting to deliver a single record.
+type deliveryOutcome int
+
 const (
-	deliverBaseBackoff = 100 * time.Millisecond
-	deliverMaxBackoff  = 30 * time.Second
+	// deliveredOK: the function acknowledged the record (2xx). Commit the offset.
+	deliveredOK deliveryOutcome = iota
+	// deliveryExhausted: a finite retry budget was used up without an ack. The
+	// record is skipped and its offset committed (so the partition is not
+	// wedged); the record is dropped.
+	deliveryExhausted
+	// deliveryAborted: the session context was cancelled (rebalance/shutdown)
+	// before a successful delivery. Do NOT commit, so the record is redelivered
+	// from the last committed offset in the next session.
+	deliveryAborted
 )
 
-// deliver invokes the function for a single record, retrying transient failures
-// with exponential backoff until it succeeds. It returns false only when ctx is
-// cancelled (rebalance/shutdown) before a successful delivery.
-func (h *consumerGroupHandler) deliver(ctx context.Context, msg *sarama.ConsumerMessage, e event.Event) bool {
-	backoff := deliverBaseBackoff
+// deliver invokes the function for a single record, retrying failed attempts per
+// the handler's deliveryConfig. It returns deliveredOK on a successful ack,
+// deliveryExhausted when a finite retry budget is used up, and deliveryAborted
+// when ctx is cancelled (rebalance/shutdown) before success.
+func (h *consumerGroupHandler) deliver(ctx context.Context, msg *sarama.ConsumerMessage, e event.Event) deliveryOutcome {
+	cfg := h.delivery
 	for attempt := 1; ; attempt++ {
-		if _, err := h.adapter.Invoke(ctx, e); err == nil {
-			return true
-		} else {
+		_, err := h.adapter.Invoke(ctx, e)
+		if err == nil {
+			return deliveredOK
+		}
+
+		// Stop once a finite retry budget is exhausted. A loud warning makes the
+		// dropped record visible; an observability metric is tracked separately
+		// (the runtime has no metrics subsystem yet).
+		if !cfg.unlimited() && attempt >= cfg.maxAttempts() {
 			log.Warn().Err(err).
 				Str("topic", msg.Topic).
 				Int32("partition", msg.Partition).
 				Int64("offset", msg.Offset).
 				Int("attempt", attempt).
-				Dur("retryIn", backoff).
-				Msg("delivery to function failed; will retry")
+				Int("maxAttempts", cfg.maxAttempts()).
+				Msg("delivery to function failed and the retry budget is exhausted; skipping record and committing offset (record dropped)")
+			return deliveryExhausted
 		}
+
+		backoff := cfg.backoffFor(attempt)
+		log.Warn().Err(err).
+			Str("topic", msg.Topic).
+			Int32("partition", msg.Partition).
+			Int64("offset", msg.Offset).
+			Int("attempt", attempt).
+			Dur("retryIn", backoff).
+			Msg("delivery to function failed; will retry")
 
 		select {
 		case <-ctx.Done():
-			return false
+			return deliveryAborted
 		case <-time.After(backoff):
-		}
-
-		if backoff < deliverMaxBackoff {
-			backoff *= 2
-			if backoff > deliverMaxBackoff {
-				backoff = deliverMaxBackoff
-			}
 		}
 	}
 }
