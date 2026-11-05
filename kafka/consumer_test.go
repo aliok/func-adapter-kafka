@@ -583,6 +583,39 @@ func TestDeliver_ZeroRetriesIsSingleAttempt(t *testing.T) {
 	}
 }
 
+// A cancelled context (rebalance/shutdown) landing on a failing attempt must be
+// classified as deliveryAborted, not deliveryExhausted, even with a finite retry
+// budget: the record has to be redelivered next session, not committed and
+// dropped. Without the context check in deliver, the final attempt of a finite
+// budget (and the whole window when retry=0) would misreport exhaustion and the
+// caller would mark the offset -- silently losing a record on a routine deploy.
+func TestDeliver_FiniteBudgetAbortsOnContextCancel(t *testing.T) {
+	for _, retry := range []int{0, 2} {
+		t.Run(fmt.Sprintf("retry=%d", retry), func(t *testing.T) {
+			fake := &flakyAdapter{alwaysFail: true}
+			cfg := fastUnlimitedDelivery()
+			cfg.retry = retry // finite budget
+			h := &consumerGroupHandler{adapter: fake, delivery: cfg}
+			msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			done := make(chan deliveryOutcome, 1)
+			go func() { done <- h.deliver(ctx, msg, event.New()) }()
+
+			select {
+			case out := <-done:
+				if out != deliveryAborted {
+					t.Fatalf("deliver returned %v on a cancelled context with retry=%d; want deliveryAborted (record must be redelivered, not dropped)", out, retry)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("deliver did not return after context cancellation")
+			}
+		})
+	}
+}
+
 func TestConsume_MissingEnvVars(t *testing.T) {
 	tests := []struct {
 		name    string

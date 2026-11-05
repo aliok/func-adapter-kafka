@@ -246,6 +246,18 @@ func (h *consumerGroupHandler) deliver(ctx context.Context, msg *sarama.Consumer
 			return deliveredOK
 		}
 
+		// A cancelled context (rebalance/shutdown) surfaces here as an Invoke
+		// error. Classify it as aborted -- not a genuine delivery failure --
+		// before the exhaustion check, so the record is redelivered from the last
+		// committed offset next session rather than being committed and dropped.
+		// This matters most on the final attempt of a finite budget (and for the
+		// whole window when retry is 0), where the exhaustion branch below would
+		// otherwise fire. When a real failure and cancellation coincide, abort is
+		// the at-least-once-safe choice.
+		if ctx.Err() != nil {
+			return deliveryAborted
+		}
+
 		// Stop once a finite retry budget is exhausted. A loud warning makes the
 		// dropped record visible; an observability metric is tracked separately
 		// (the runtime has no metrics subsystem yet).
