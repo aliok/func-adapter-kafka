@@ -494,20 +494,31 @@ func (f *flakyAdapter) Invoke(context.Context, event.Event) (*event.Event, error
 	f.calls++
 	if f.alwaysFail || f.failuresLeft > 0 {
 		f.failuresLeft--
-		return nil, errors.New("transient delivery failure")
+		return nil, errors.New("delivery failed")
 	}
 	return nil, nil
+}
+
+// fastUnlimitedDelivery is the default (unlimited retries) with a tiny backoff so
+// retry-driven tests do not sleep for the production 100ms→30s schedule.
+func fastUnlimitedDelivery() deliveryConfig {
+	return deliveryConfig{
+		retry:     -1,
+		policy:    backoffExponential,
+		baseDelay: time.Millisecond,
+		maxDelay:  5 * time.Millisecond,
+	}
 }
 
 // deliver retries a transient failure and only marks the offset once delivery
 // succeeds, so a record is never skipped after a blip like a stale keep-alive.
 func TestDeliver_RetriesUntilSuccess(t *testing.T) {
 	fake := &flakyAdapter{failuresLeft: 2}
-	h := &consumerGroupHandler{adapter: fake}
+	h := &consumerGroupHandler{adapter: fake, delivery: fastUnlimitedDelivery()}
 	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
 
-	if ok := h.deliver(context.Background(), msg, event.New()); !ok {
-		t.Fatal("deliver returned false; want true after retries eventually succeed")
+	if out := h.deliver(context.Background(), msg, event.New()); out != deliveredOK {
+		t.Fatalf("deliver returned %v; want deliveredOK after retries eventually succeed", out)
 	}
 	if fake.calls != 3 {
 		t.Errorf("Invoke called %d times, want 3 (2 failures + 1 success)", fake.calls)
@@ -515,26 +526,96 @@ func TestDeliver_RetriesUntilSuccess(t *testing.T) {
 }
 
 // When the session context is cancelled while delivery keeps failing, deliver
-// stops and reports false so the caller does NOT mark the offset (the record is
-// redelivered from the last committed offset in the next session).
+// stops and reports deliveryAborted so the caller does NOT mark the offset (the
+// record is redelivered from the last committed offset in the next session).
 func TestDeliver_StopsOnContextCancel(t *testing.T) {
 	fake := &flakyAdapter{alwaysFail: true}
-	h := &consumerGroupHandler{adapter: fake}
+	h := &consumerGroupHandler{adapter: fake, delivery: fastUnlimitedDelivery()}
 	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	done := make(chan bool, 1)
+	done := make(chan deliveryOutcome, 1)
 	go func() { done <- h.deliver(ctx, msg, event.New()) }()
 
 	select {
-	case ok := <-done:
-		if ok {
-			t.Fatal("deliver returned true on a cancelled context; want false")
+	case out := <-done:
+		if out != deliveryAborted {
+			t.Fatalf("deliver returned %v on a cancelled context; want deliveryAborted", out)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("deliver did not return after context cancellation")
+	}
+}
+
+// With a finite retry budget and a function that always fails, deliver stops after
+// retry+1 total attempts and reports deliveryExhausted so the caller commits the
+// offset (skip-and-commit) instead of wedging the partition. Every delivery failure
+// counts toward the budget -- here a generic (transport-style) failure -- matching
+// Knative Eventing; a non-2xx rejection, a per-attempt timeout, and a transport/dial
+// error are not distinguished.
+func TestDeliver_ExhaustsFiniteRetryBudget(t *testing.T) {
+	fake := &flakyAdapter{alwaysFail: true}
+	cfg := fastUnlimitedDelivery()
+	cfg.retry = 2 // 3 total attempts
+	h := &consumerGroupHandler{adapter: fake, delivery: cfg}
+	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
+
+	if out := h.deliver(context.Background(), msg, event.New()); out != deliveryExhausted {
+		t.Fatalf("deliver returned %v; want deliveryExhausted", out)
+	}
+	if fake.calls != 3 {
+		t.Errorf("Invoke called %d times, want 3 (retry=2 → 3 total attempts)", fake.calls)
+	}
+}
+
+// retry=0 means a single attempt with no retry: one failure exhausts immediately.
+func TestDeliver_ZeroRetriesIsSingleAttempt(t *testing.T) {
+	fake := &flakyAdapter{alwaysFail: true}
+	cfg := fastUnlimitedDelivery()
+	cfg.retry = 0
+	h := &consumerGroupHandler{adapter: fake, delivery: cfg}
+	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
+
+	if out := h.deliver(context.Background(), msg, event.New()); out != deliveryExhausted {
+		t.Fatalf("deliver returned %v; want deliveryExhausted", out)
+	}
+	if fake.calls != 1 {
+		t.Errorf("Invoke called %d times, want 1 (retry=0 → single attempt)", fake.calls)
+	}
+}
+
+// A cancelled context (rebalance/shutdown) landing on a failing attempt must be
+// classified as deliveryAborted, not deliveryExhausted, even with a finite retry
+// budget: the record has to be redelivered next session, not committed and
+// dropped. Without the context check in deliver, the final attempt of a finite
+// budget (and the whole window when retry=0) would misreport exhaustion and the
+// caller would mark the offset -- silently losing a record on a routine deploy.
+func TestDeliver_FiniteBudgetAbortsOnContextCancel(t *testing.T) {
+	for _, retry := range []int{0, 2} {
+		t.Run(fmt.Sprintf("retry=%d", retry), func(t *testing.T) {
+			fake := &flakyAdapter{alwaysFail: true}
+			cfg := fastUnlimitedDelivery()
+			cfg.retry = retry // finite budget
+			h := &consumerGroupHandler{adapter: fake, delivery: cfg}
+			msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			done := make(chan deliveryOutcome, 1)
+			go func() { done <- h.deliver(ctx, msg, event.New()) }()
+
+			select {
+			case out := <-done:
+				if out != deliveryAborted {
+					t.Fatalf("deliver returned %v on a cancelled context with retry=%d; want deliveryAborted (record must be redelivered, not dropped)", out, retry)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("deliver did not return after context cancellation")
+			}
+		})
 	}
 }
 
@@ -577,7 +658,7 @@ func TestConsume_MissingEnvVars(t *testing.T) {
 			}
 
 			var ready atomic.Bool
-			err := consume(context.Background(), stubAdapter{}, &ready)
+			err := consume(context.Background(), stubAdapter{}, &ready, defaultDeliveryConfig())
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}

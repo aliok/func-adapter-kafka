@@ -64,7 +64,9 @@ func TestHTTPAdapter_2xxCommits(t *testing.T) {
 }
 
 // A non-2xx response is a failure: Invoke returns an error so the offset is NOT
-// committed and the record is redelivered.
+// committed and the record is redelivered. Every delivery failure counts toward a
+// finite retry budget (matching Knative Eventing); Invoke no longer classifies the
+// failure, it just returns a non-nil error.
 func TestHTTPAdapter_Non2xxRetries(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -75,7 +77,8 @@ func TestHTTPAdapter_Non2xxRetries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newHTTPAdapter: %v", err)
 	}
-	if _, err := a.Invoke(context.Background(), newTestEvent(t)); err == nil {
+	_, err = a.Invoke(context.Background(), newTestEvent(t))
+	if err == nil {
 		t.Fatal("Invoke returned nil on 500; want error so the offset is not committed")
 	}
 }
@@ -99,7 +102,8 @@ func TestHTTPAdapter_TimeoutFails(t *testing.T) {
 	}
 
 	start := time.Now()
-	if _, err := a.Invoke(context.Background(), newTestEvent(t)); err == nil {
+	_, err = a.Invoke(context.Background(), newTestEvent(t))
+	if err == nil {
 		t.Fatal("Invoke returned nil for a non-responding function; want a timeout error")
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
@@ -117,7 +121,9 @@ func TestRequestTimeout(t *testing.T) {
 	}{
 		{name: "unset uses default", set: false, want: DefaultRequestTimeout},
 		{name: "empty uses default", set: true, value: "", want: DefaultRequestTimeout},
+		{name: "blank uses default", set: true, value: "   ", want: DefaultRequestTimeout},
 		{name: "custom duration", set: true, value: "45s", want: 45 * time.Second},
+		{name: "padded duration trimmed", set: true, value: "  45s  ", want: 45 * time.Second},
 		{name: "zero disables", set: true, value: "0", want: 0},
 		{name: "invalid", set: true, value: "banana", wantErr: true},
 		{name: "negative", set: true, value: "-5s", wantErr: true},
@@ -157,7 +163,8 @@ func TestHTTPAdapter_ConnectionErrorRetries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newHTTPAdapter: %v", err)
 	}
-	if _, err := a.Invoke(context.Background(), newTestEvent(t)); err == nil {
+	_, err = a.Invoke(context.Background(), newTestEvent(t))
+	if err == nil {
 		t.Fatal("Invoke returned nil on connection failure; want error")
 	}
 }

@@ -119,7 +119,7 @@ func (a *capturingAdapter) attemptIDs() []string {
 // consuming -- a mutant that returns after the first record would mark only 42.
 func TestConsumeClaim_MarksOffsetOnSuccess(t *testing.T) {
 	adapter := &capturingAdapter{called: make(chan struct{}, 2)}
-	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092"}
+	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092", delivery: defaultDeliveryConfig()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -165,7 +165,7 @@ func TestConsumeClaim_MarksOffsetOnSuccess(t *testing.T) {
 // would survive (the other tests use records that carry neither).
 func TestConsumeClaim_ConvertsRecordFields(t *testing.T) {
 	adapter := &capturingAdapter{called: make(chan struct{}, 1)}
-	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092"}
+	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092", delivery: defaultDeliveryConfig()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -217,7 +217,7 @@ func TestConsumeClaim_ConvertsRecordFields(t *testing.T) {
 // other test failing.
 func TestConsumeClaim_PassesThroughCloudEventHeaders(t *testing.T) {
 	adapter := &capturingAdapter{called: make(chan struct{}, 1)}
-	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092"}
+	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092", delivery: defaultDeliveryConfig()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -268,8 +268,8 @@ func TestConsumeClaim_PassesThroughCloudEventHeaders(t *testing.T) {
 // (43) is queued behind the failing one (42) specifically so a mutant that gives
 // up after N tries and advances would be caught: it would attempt 43 and/or mark.
 func TestConsumeClaim_DoesNotMarkOffsetOnFailure(t *testing.T) {
-	adapter := &capturingAdapter{err: errors.New("non-2xx from function"), called: make(chan struct{}, 16)}
-	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092"}
+	adapter := &capturingAdapter{err: errors.New("delivery failed"), called: make(chan struct{}, 16)}
+	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092", delivery: defaultDeliveryConfig()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -314,5 +314,67 @@ func TestConsumeClaim_DoesNotMarkOffsetOnFailure(t *testing.T) {
 	case m := <-session.marked:
 		t.Fatalf("offset %d was marked despite delivery never succeeding", m.Offset)
 	default:
+	}
+}
+
+// perOffsetAdapter fails every delivery whose event ID matches failID and
+// succeeds for all others, so a test can make one specific record exhaust its
+// retry budget while a later record is delivered normally.
+type perOffsetAdapter struct {
+	failID string
+	calls  atomic.Int64
+}
+
+func (a *perOffsetAdapter) Invoke(_ context.Context, e event.Event) (*event.Event, error) {
+	a.calls.Add(1)
+	if e.ID() == a.failID {
+		return nil, errors.New("delivery failed")
+	}
+	return nil, nil
+}
+
+// TestConsumeClaim_MarksOffsetAfterExhaustion covers the finite-budget glue that
+// the deliver-level tests do not reach: when a record exhausts its retry budget
+// (deliveryExhausted), ConsumeClaim must COMMIT its offset so the partition is not
+// wedged by a poison pill, then advance to and deliver the next record. The first
+// record (42) always fails and is dropped after its budget; the second (43)
+// succeeds. Both offsets must be marked, in order. Without the exhausted ->
+// MarkMessage fall-through, 42 would block the partition forever and 43 would
+// never be delivered.
+func TestConsumeClaim_MarksOffsetAfterExhaustion(t *testing.T) {
+	adapter := &perOffsetAdapter{failID: "partition:0/offset:42"}
+	cfg := deliveryConfig{policy: backoffExponential, baseDelay: time.Millisecond, maxDelay: 5 * time.Millisecond, retry: 1}
+	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092", delivery: cfg}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	session := &recordingSession{ctx: ctx, marked: make(chan *sarama.ConsumerMessage, 2)}
+	claim := &channelClaim{topic: "orders", partition: 0, messages: make(chan *sarama.ConsumerMessage, 2)}
+
+	claim.messages <- &sarama.ConsumerMessage{Topic: "orders", Partition: 0, Offset: 42, Value: []byte("a")}
+	claim.messages <- &sarama.ConsumerMessage{Topic: "orders", Partition: 0, Offset: 43, Value: []byte("b")}
+	close(claim.messages)
+
+	done := make(chan error, 1)
+	go func() { done <- h.ConsumeClaim(session, claim) }()
+
+	// 42 is committed after its budget is exhausted (dropped), then 43 is
+	// delivered and committed -- proving the partition advanced past the poison pill.
+	for _, want := range []int64{42, 43} {
+		select {
+		case marked := <-session.marked:
+			if marked.Offset != want {
+				t.Errorf("marked offset = %d, want %d", marked.Offset, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("offset %d was not marked", want)
+		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConsumeClaim did not return after the claim was closed")
 	}
 }

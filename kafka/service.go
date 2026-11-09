@@ -112,6 +112,16 @@ func (s *Service) Start(ctx context.Context) (err error) {
 	addr := listenAddress()
 	log.Debug().Str("address", addr).Msg("kafka runtime starting")
 
+	// Parse and validate delivery configuration before the health server starts or
+	// the function target is awaited, so a malformed FUNCTION_DELIVERY_* value
+	// fails immediately at process startup. Validating it inside consume (after the
+	// target wait) meant a bad value was masked by -- and reported only after -- a
+	// target-wait timeout when the function was slow to start or unavailable.
+	deliveryCfg, err := loadDeliveryConfig()
+	if err != nil {
+		return fmt.Errorf("configuring delivery: %w", err)
+	}
+
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -152,7 +162,7 @@ func (s *Service) Start(ctx context.Context) (err error) {
 			return
 		}
 
-		if err := consume(consumerCtx, s.adapter, &s.ready); err != nil {
+		if err := consume(consumerCtx, s.adapter, &s.ready, deliveryCfg); err != nil {
 			log.Error().Err(err).Msg("kafka consumer exited with error")
 			s.sendStop(err)
 		}

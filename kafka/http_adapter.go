@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	nethttp "net/http"
-	"os"
 	"strconv"
 	"time"
 
@@ -115,8 +114,8 @@ func newHTTPAdapter(target string) (*httpAdapter, error) {
 // requestTimeout returns the per-attempt delivery timeout, honoring the
 // FUNCTION_REQUEST_TIMEOUT override.
 func requestTimeout() (time.Duration, error) {
-	v, ok := os.LookupEnv("FUNCTION_REQUEST_TIMEOUT")
-	if !ok || v == "" {
+	v, ok := lookupNonEmptyEnv("FUNCTION_REQUEST_TIMEOUT")
+	if !ok {
 		return DefaultRequestTimeout, nil
 	}
 	d, err := time.ParseDuration(v)
@@ -132,8 +131,8 @@ func requestTimeout() (time.Duration, error) {
 // maxConcurrency returns the maximum number of concurrent in-flight deliveries,
 // honoring the FUNCTION_MAX_CONCURRENCY override. 0 means unbounded.
 func maxConcurrency() (int, error) {
-	v, ok := os.LookupEnv("FUNCTION_MAX_CONCURRENCY")
-	if !ok || v == "" {
+	v, ok := lookupNonEmptyEnv("FUNCTION_MAX_CONCURRENCY")
+	if !ok {
 		return DefaultMaxConcurrency, nil
 	}
 	n, err := strconv.Atoi(v)
@@ -158,15 +157,18 @@ func (a *httpAdapter) Invoke(ctx context.Context, e event.Event) (*event.Event, 
 		}
 	}
 
+	// reqCtx carries the per-attempt timeout; keep ctx (the session context) so a
+	// timeout can be told apart from a shutdown/rebalance cancellation below.
+	reqCtx := ctx
 	if a.timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, a.timeout)
+		reqCtx, cancel = context.WithTimeout(ctx, a.timeout)
 		defer cancel()
 	}
-	ctx = cloudevents.ContextWithTarget(ctx, a.target)
-	ctx = cloudevents.WithEncodingBinary(ctx)
+	reqCtx = cloudevents.ContextWithTarget(reqCtx, a.target)
+	reqCtx = cloudevents.WithEncodingBinary(reqCtx)
 
-	resp, result := a.client.Request(ctx, e)
+	resp, result := a.client.Request(reqCtx, e)
 
 	// The commit ack is a 2xx HTTP status. Check the status explicitly rather
 	// than relying on IsACK, which treats a delivered-but-rejected response
@@ -179,7 +181,11 @@ func (a *httpAdapter) Invoke(ctx context.Context, e event.Event) (*event.Event, 
 		return nil, fmt.Errorf("function returned non-2xx status %d: %w", httpResult.StatusCode, result)
 	}
 
-	// No HTTP status available means the request never completed (transport
-	// error, timeout): treat as a failure so the record is redelivered.
+	// No HTTP status means the request did not complete: a transport/dial error
+	// (the function was unreachable) or a per-attempt timeout. Every such failure
+	// is a failed delivery that the consumer retries and counts toward a finite
+	// retry budget, exactly like a non-2xx response -- matching Knative Eventing's
+	// delivery semantics. The consumer distinguishes a session-context
+	// cancellation (rebalance/shutdown) via ctx.Err() before it reaches the budget.
 	return nil, fmt.Errorf("delivering event to %s failed: %w", a.target, result)
 }
