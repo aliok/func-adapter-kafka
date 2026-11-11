@@ -1,0 +1,67 @@
+# Copyright 2026 The Knative Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+# Real-broker delivery/retry E2E for the Kafka runtime. The stock Test workflow
+# (knative-go-test.yaml) runs the mock-based unit suite; this one stands up a real
+# Kafka broker and runs the `e2e`-tagged suite against it.
+#
+# The tests are broker-agnostic: they consume KAFKA_E2E_BOOTSTRAP and skip when it
+# is unset. The broker here (single-node Apache Kafka in KRaft mode) is purely a CI
+# convenience; the suite would run just as well against docker-compose or a Strimzi
+# cluster by pointing KAFKA_E2E_BOOTSTRAP elsewhere.
+
+name: E2E
+
+on:
+  push:
+    branches: [ 'main', 'release-*' ]
+  pull_request:
+    branches: [ 'main', 'release-*' ]
+
+jobs:
+  delivery-e2e:
+    name: Delivery/retry E2E (real broker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Start Kafka broker (Apache Kafka, KRaft)
+        run: |
+          docker run -d --name kafka -p 9092:9092 \
+            -e KAFKA_NODE_ID=1 \
+            -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+            -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            apache/kafka:4.3.1
+
+      - name: Wait for broker to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1; then
+              echo "broker is ready"
+              exit 0
+            fi
+            echo "waiting for broker ($i)..."
+            sleep 2
+          done
+          echo "broker did not become ready in time" >&2
+          docker logs kafka || true
+          exit 1
+
+      - name: Run delivery/retry E2E suite
+        env:
+          KAFKA_E2E_BOOTSTRAP: localhost:9092
+        run: make test-e2e

@@ -8,7 +8,7 @@ BINARY := $(BINDIR)/fkafka-runtime
 # destination; it defaults to ko.local for a local-only build.
 KO_DOCKER_REPO ?= ko.local
 
-.PHONY: all build test vet fmt check image clean
+.PHONY: all build test test-e2e vet fmt check image clean
 
 all: check build
 
@@ -19,6 +19,12 @@ build:
 ## test: run unit tests
 test:
 	go test ./...
+
+## test-e2e: run the real-broker delivery/retry E2E suite (build tag: e2e).
+## Requires a reachable Kafka: set KAFKA_E2E_BOOTSTRAP to its bootstrap address
+## (e.g. localhost:9092). Without it the suite skips rather than fails.
+test-e2e:
+	go test -tags e2e -count=1 -timeout 15m ./kafka/ -run '^TestE2E'
 
 ## vet: run go vet
 vet:
