@@ -53,8 +53,8 @@ const (
 func main() {
 	// The runtime's own health server must not collide with the function's
 	// 8080 in the shared network namespace of a sidecar Pod.
-	if os.Getenv("LISTEN_ADDRESS") == "" {
-		os.Setenv("LISTEN_ADDRESS", defaultListenAddress)
+	if os.Getenv(kafka.EnvListenAddress) == "" {
+		os.Setenv(kafka.EnvListenAddress, defaultListenAddress)
 	}
 
 	// Start serves health immediately and waits for the function target before
@@ -72,7 +72,7 @@ func main() {
 }
 
 func functionTarget() string {
-	if v := strings.TrimSpace(os.Getenv("FUNCTION_TARGET")); v != "" {
+	if v := strings.TrimSpace(os.Getenv(kafka.EnvFunctionTarget)); v != "" {
 		return v
 	}
 	return defaultFunctionTarget

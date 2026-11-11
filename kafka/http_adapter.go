@@ -114,7 +114,7 @@ func newHTTPAdapter(target string) (*httpAdapter, error) {
 // requestTimeout returns the per-attempt delivery timeout, honoring the
 // FUNCTION_REQUEST_TIMEOUT override.
 func requestTimeout() (time.Duration, error) {
-	v, ok := lookupNonEmptyEnv("FUNCTION_REQUEST_TIMEOUT")
+	v, ok := lookupNonEmptyEnv(EnvFunctionRequestTimeout)
 	if !ok {
 		return DefaultRequestTimeout, nil
 	}
@@ -131,7 +131,7 @@ func requestTimeout() (time.Duration, error) {
 // maxConcurrency returns the maximum number of concurrent in-flight deliveries,
 // honoring the FUNCTION_MAX_CONCURRENCY override. 0 means unbounded.
 func maxConcurrency() (int, error) {
-	v, ok := lookupNonEmptyEnv("FUNCTION_MAX_CONCURRENCY")
+	v, ok := lookupNonEmptyEnv(EnvFunctionMaxConcurrency)
 	if !ok {
 		return DefaultMaxConcurrency, nil
 	}

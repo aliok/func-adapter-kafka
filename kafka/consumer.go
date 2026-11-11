@@ -34,7 +34,7 @@ import (
 )
 
 func kafkaBrokers() []string {
-	v := os.Getenv("KAFKA_BROKERS")
+	v := os.Getenv(EnvKafkaBrokers)
 	if v == "" {
 		return nil
 	}
@@ -42,11 +42,11 @@ func kafkaBrokers() []string {
 }
 
 func kafkaTopic() string {
-	return strings.TrimSpace(os.Getenv("KAFKA_TOPIC"))
+	return strings.TrimSpace(os.Getenv(EnvKafkaTopic))
 }
 
 func kafkaConsumerGroup() string {
-	return strings.TrimSpace(os.Getenv("KAFKA_CONSUMER_GROUP"))
+	return strings.TrimSpace(os.Getenv(EnvKafkaConsumerGroup))
 }
 
 func splitAndTrim(s string) []string {

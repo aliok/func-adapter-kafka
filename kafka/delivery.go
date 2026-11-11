@@ -150,7 +150,7 @@ func loadDeliveryConfig() (deliveryConfig, error) {
 	// (e.g. an unrendered template FUNCTION_DELIVERY_RETRY=) as "omitted" would
 	// silently re-enable unlimited delivery, so an empty/blank value is a startup
 	// error. The benign variables keep their empty-is-default leniency.
-	if raw, ok := os.LookupEnv("FUNCTION_DELIVERY_RETRY"); ok {
+	if raw, ok := os.LookupEnv(EnvFunctionDeliveryRetry); ok {
 		v := strings.TrimSpace(raw)
 		if v == "" {
 			return deliveryConfig{}, fmt.Errorf("invalid FUNCTION_DELIVERY_RETRY %q: must not be empty (omit the variable for unlimited retries)", raw)
@@ -175,7 +175,7 @@ func loadDeliveryConfig() (deliveryConfig, error) {
 		c.retry = n
 	}
 
-	if v, ok := lookupNonEmptyEnv("FUNCTION_DELIVERY_BACKOFF_POLICY"); ok {
+	if v, ok := lookupNonEmptyEnv(EnvFunctionDeliveryBackoffPolicy); ok {
 		switch strings.ToLower(v) {
 		case string(backoffExponential):
 			c.policy = backoffExponential
@@ -187,8 +187,8 @@ func loadDeliveryConfig() (deliveryConfig, error) {
 	}
 
 	baseDelaySet := false
-	if v, ok := lookupNonEmptyEnv("FUNCTION_DELIVERY_BACKOFF_DELAY"); ok {
-		d, err := parseNonNegativeDuration("FUNCTION_DELIVERY_BACKOFF_DELAY", v)
+	if v, ok := lookupNonEmptyEnv(EnvFunctionDeliveryBackoffDelay); ok {
+		d, err := parseNonNegativeDuration(EnvFunctionDeliveryBackoffDelay, v)
 		if err != nil {
 			return deliveryConfig{}, err
 		}
@@ -197,8 +197,8 @@ func loadDeliveryConfig() (deliveryConfig, error) {
 	}
 
 	maxDelaySet := false
-	if v, ok := lookupNonEmptyEnv("FUNCTION_DELIVERY_BACKOFF_MAX_DELAY"); ok {
-		d, err := parseNonNegativeDuration("FUNCTION_DELIVERY_BACKOFF_MAX_DELAY", v)
+	if v, ok := lookupNonEmptyEnv(EnvFunctionDeliveryBackoffMaxDelay); ok {
+		d, err := parseNonNegativeDuration(EnvFunctionDeliveryBackoffMaxDelay, v)
 		if err != nil {
 			return deliveryConfig{}, err
 		}
@@ -213,8 +213,8 @@ func loadDeliveryConfig() (deliveryConfig, error) {
 	// pointing the user at a variable they never set.
 	if c.maxDelay < c.baseDelay {
 		return deliveryConfig{}, fmt.Errorf("%s must be >= %s",
-			describeDelayValue("FUNCTION_DELIVERY_BACKOFF_MAX_DELAY", c.maxDelay, maxDelaySet),
-			describeDelayValue("FUNCTION_DELIVERY_BACKOFF_DELAY", c.baseDelay, baseDelaySet))
+			describeDelayValue(EnvFunctionDeliveryBackoffMaxDelay, c.maxDelay, maxDelaySet),
+			describeDelayValue(EnvFunctionDeliveryBackoffDelay, c.baseDelay, baseDelaySet))
 	}
 
 	return c, nil
