@@ -69,6 +69,21 @@ const (
 	envFunctionRequestTimeout     = "FUNCTION_REQUEST_TIMEOUT"
 )
 
+// runtimeOverrideEnvVars are the delivery/timeout variables a scenario drives via
+// extraEnv. startService clears any inherited value before applying the scenario's
+// own, so a value already in the caller's environment (CI, a developer shell)
+// cannot leak in and silently change a scenario -- e.g. an inherited
+// FUNCTION_DELIVERY_RETRY would corrupt the unlimited-retry default scenario, and
+// an inherited invalid FUNCTION_REQUEST_TIMEOUT would make New fail before the test
+// even runs.
+var runtimeOverrideEnvVars = []string{
+	envFunctionDeliveryRetry,
+	envFunctionDeliveryBackoffPol,
+	envFunctionDeliveryBackoffDel,
+	envFunctionDeliveryBackoffMax,
+	envFunctionRequestTimeout,
+}
+
 // settleAfterReady is a short pause between the consumer reporting ready
 // (partitions assigned) and the test producing records. The runtime consumes
 // from OffsetNewest, so a record produced before the fetch position is
@@ -126,6 +141,15 @@ func newHarness(t *testing.T) *harness {
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V2_0_0_0
 	cfg.Producer.Return.Successes = true
+	// Apply the same TLS/SASL settings the runtime uses (read from
+	// KAFKA_SECURITY_PROTOCOL / KAFKA_TLS_* / KAFKA_SASL_*) so the fixtures -- admin,
+	// producer, client -- can reach a secured broker too. Without this the
+	// "broker-agnostic" suite could only ever run against a PLAINTEXT broker, even
+	// though the runtime under test supports secured ones. For the default
+	// (unset/PLAINTEXT) case configureSecurity is a no-op.
+	if err := configureSecurity(cfg); err != nil {
+		t.Fatalf("configuring fixture security from KAFKA_* env: %v", err)
+	}
 
 	admin, err := sarama.NewClusterAdmin(brokers, cfg)
 	if err != nil {
@@ -237,6 +261,15 @@ func (h *harness) startService(t *testing.T, target string, extraEnv map[string]
 	t.Setenv(envKafkaTopic, h.topic)
 	t.Setenv(envKafkaConsumerGroup, h.group)
 	t.Setenv(envListenAddress, "127.0.0.1:0")
+	// Start each scenario from a clean slate: unset any inherited runtime override so
+	// only the scenario's extraEnv applies. t.Setenv records the original for
+	// restoration; os.Unsetenv then truly removes it -- a present-but-empty
+	// FUNCTION_DELIVERY_RETRY is itself a startup error, so it must be unset, not
+	// blanked.
+	for _, k := range runtimeOverrideEnvVars {
+		t.Setenv(k, "")
+		os.Unsetenv(k)
+	}
 	for k, v := range extraEnv {
 		t.Setenv(k, v)
 	}
@@ -296,6 +329,7 @@ type reqRecord struct {
 	attempt int
 	at      time.Time
 	status  int
+	header  http.Header
 }
 
 // newFuncServer starts a scripted receiver. respond is called per request with
@@ -309,6 +343,10 @@ func newFuncServer(t *testing.T, respond func(body string, attempt int) (status 
 		at := time.Now()
 		b, _ := io.ReadAll(r.Body)
 		body := string(b)
+		// Clone the headers so the CloudEvent metadata the runtime mapped onto the
+		// record (the Ce-* context attributes and Content-Type) can be asserted
+		// later, not just the body.
+		hdr := r.Header.Clone()
 
 		fs.mu.Lock()
 		fs.counts[body]++
@@ -318,7 +356,7 @@ func newFuncServer(t *testing.T, respond func(body string, attempt int) (status 
 		status, delay := fs.respond(body, n)
 
 		fs.mu.Lock()
-		fs.log = append(fs.log, reqRecord{body: body, attempt: n, at: at, status: status})
+		fs.log = append(fs.log, reqRecord{body: body, attempt: n, at: at, status: status, header: hdr})
 		fs.mu.Unlock()
 
 		if delay > 0 {
@@ -351,6 +389,20 @@ func (fs *funcServer) successes(body string) int {
 		}
 	}
 	return n
+}
+
+// firstDelivery returns the recorded request for the first delivery of body and
+// whether any delivery of body has been received. Used to assert the CloudEvent
+// metadata the runtime mapped onto at least one record.
+func (fs *funcServer) firstDelivery(body string) (reqRecord, bool) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	for _, r := range fs.log {
+		if r.body == body {
+			return r, true
+		}
+	}
+	return reqRecord{}, false
 }
 
 // totalRequests returns the number of deliveries received across all records.
@@ -406,3 +458,33 @@ func waitFor(t *testing.T, timeout time.Duration, desc string, cond func() bool)
 
 // settle pauses briefly after readiness before producing (see settleAfterReady).
 func (h *harness) settle() { time.Sleep(settleAfterReady) }
+
+// assertBinaryCloudEvent verifies a delivery carried the binary-mode CloudEvent
+// the runtime maps a plain (non-CloudEvent) Kafka record to -- see
+// kafkaMessageToEvent. The context attributes travel as Ce-* HTTP headers and the
+// record value is the body with an application/octet-stream content type. This
+// proves scenario 1's CloudEvent mapping end to end: a regression in
+// kafkaMessageToEvent or the binary encoding would otherwise pass a body-only
+// check. The event ID embeds the partition/offset, which vary, so it is matched by
+// shape rather than exact value.
+func assertBinaryCloudEvent(t *testing.T, h *harness, rec reqRecord, wantBody string) {
+	t.Helper()
+	if rec.body != wantBody {
+		t.Errorf("delivered body = %q, want %q", rec.body, wantBody)
+	}
+	checks := map[string]string{
+		"Ce-Specversion": "1.0",
+		"Ce-Type":        "dev.knative.kafka.event",
+		"Ce-Source":      "kafka://" + strings.Join(h.brokers, ",") + "/" + h.topic,
+		"Ce-Kafkatopic":  h.topic,
+		"Content-Type":   "application/octet-stream",
+	}
+	for header, want := range checks {
+		if got := rec.header.Get(header); got != want {
+			t.Errorf("delivered %s = %q, want %q", header, got, want)
+		}
+	}
+	if got := rec.header.Get("Ce-Id"); !strings.HasPrefix(got, "partition:0/offset:") {
+		t.Errorf("delivered Ce-Id = %q, want it to encode partition 0 and an offset (partition:0/offset:<n>)", got)
+	}
+}
