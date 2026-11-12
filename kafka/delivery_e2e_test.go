@@ -59,6 +59,13 @@ func TestE2E_HappyPath(t *testing.T) {
 			t.Errorf("record %q delivered %d times, want exactly 1", v, got)
 		}
 	}
+	// Scenario 1 requires the record to arrive as the mapped CloudEvent, not merely
+	// as some HTTP body: verify the binary-mode CloudEvent metadata for one record.
+	rec, ok := fs.firstDelivery("r0")
+	if !ok {
+		t.Fatal("no delivery recorded for r0")
+	}
+	assertBinaryCloudEvent(t, h, rec, "r0")
 	waitFor(t, commitTimeout, "offsets committed (zero lag)", func() bool {
 		return h.lag() == 0
 	})
@@ -309,7 +316,7 @@ func TestE2E_Backoff(t *testing.T) {
 
 	t.Run("maxDelayCap", func(t *testing.T) {
 		h := newHarness(t)
-		const failUntil = 4
+		const failUntil = 5
 		fs := newFuncServer(t, func(body string, n int) (int, time.Duration) {
 			if body == "retryme" && n <= failUntil {
 				return 500, 0
@@ -319,7 +326,7 @@ func TestE2E_Backoff(t *testing.T) {
 		rs := h.startService(t, fs.url(), map[string]string{
 			envFunctionDeliveryBackoffPol: "exponential",
 			envFunctionDeliveryBackoffDel: "200ms",
-			envFunctionDeliveryBackoffMax: "400ms", // caps at 400ms, so never reaches 800ms
+			envFunctionDeliveryBackoffMax: "400ms", // caps at 400ms; uncapped would reach 1600ms+
 		})
 		rs.waitReady(t, readyTimeout)
 		h.settle()
@@ -328,16 +335,25 @@ func TestE2E_Backoff(t *testing.T) {
 			return fs.attempts("retryme") >= failUntil+1
 		})
 		gaps := fs.gaps("retryme")
-		if len(gaps) < 4 {
-			t.Fatalf("got %d gaps, want >= 4", len(gaps))
+		if len(gaps) < failUntil {
+			t.Fatalf("got %d gaps, want >= %d", len(gaps), failUntil)
 		}
-		// The third gap onward would be 800ms+ uncapped; the cap holds them near
-		// 400ms. Assert they are capped (well below the uncapped 800ms) yet still
-		// honor the configured delay.
-		for i := 2; i < 4; i++ {
+		// Uncapped exponential from 200ms would be 200, 400, 800, 1600, 3200 ms; the
+		// 400ms cap holds every gap from the third onward near 400ms. Real-broker and
+		// CI scheduling only ever ADD time, so assert with that asymmetry in mind:
+		//   - lower bound on the capped gaps: the configured 400ms backoff is honored
+		//     (a retry can never arrive sooner than its backoff);
+		//   - upper bound ONLY on the gaps whose uncapped value (>=1600ms) sits far
+		//     above the cap, so scheduling jitter cannot be mistaken for uncapped
+		//     growth. A capped ~400ms gap stays well under 1000ms even under load,
+		//     while an uncapped gap here would be 1600ms or 3200ms. The earlier gaps
+		//     (uncapped 800ms) are too close to the cap to bound without flaking.
+		for i := 2; i < len(gaps); i++ {
 			assertAtLeast(t, "capped gap", gaps[i], 400*time.Millisecond)
-			if gaps[i] > 700*time.Millisecond {
-				t.Errorf("gap %d = %s exceeds the 400ms cap (should not grow toward 800ms)", i+1, gaps[i])
+		}
+		for i := 3; i < len(gaps); i++ {
+			if gaps[i] >= 1000*time.Millisecond {
+				t.Errorf("gap %d = %s is not capped: with a 400ms cap it must stay well below its uncapped value (>=1600ms)", i+1, gaps[i])
 			}
 		}
 		_ = rs.stop(t)
