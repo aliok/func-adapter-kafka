@@ -21,11 +21,13 @@ import "testing"
 // goldenContractEnvVars is the exact set of env var names knative/func emits onto
 // the Kafka runtime sidecar, copied verbatim from kafkaRuntimeContractEnvNames in
 // knative/func (pkg/k8s/deployer_test.go). It is intentionally duplicated here as
-// literal strings: ContractEnvVars is built from this package's Env* constants --
-// the same constants the production read sites use -- so comparing the two catches
-// a rename on either side. A changed constant value diverges from these literals
-// and fails the test, in lockstep with func's own assertion. If a variable is
-// genuinely renamed or dropped, change both lists (and the func side) together.
+// literal strings so the test does not lean on the adapter's own constants to
+// decide what func emits: contractEnvVars is built from this package's Env*
+// constants -- the same constants the production read sites use -- so comparing
+// it against these literals catches a renamed or dropped constant on the adapter
+// side. This is not a cross-repo check -- nothing fetches func's list; these
+// literals are kept aligned with it by hand. If a variable is genuinely renamed
+// or dropped, change both lists (and the func side) together.
 var goldenContractEnvVars = []string{
 	"FUNCTION_TARGET",
 	"KAFKA_BROKERS",
@@ -47,32 +49,34 @@ var goldenContractEnvVars = []string{
 }
 
 // TestContractEnvVars pins the adapter's half of the func<->adapter env-var name
-// contract. It is the mirror of TestKafkaSidecarContainer_EnvNameContract in
-// knative/func: that test asserts the names func emits; this one asserts the names
-// the adapter reads. A rename or drop on either side (which would silently no-op a
-// setting at runtime) fails a cheap unit test here instead of surfacing only as a
-// flaky cluster run or not at all.
+// contract. It is the hand-kept mirror of TestKafkaSidecarContainer_EnvNameContract
+// in knative/func: that test asserts the names func emits; this one asserts the
+// names the adapter lists as the ones it reads. Neither test compares against the
+// other repo -- each pins its own side against a local copy, and the two copies
+// are kept in lockstep by humans. A rename or drop applied to only one side (which
+// would silently no-op a setting at runtime) fails a cheap unit test here instead
+// of surfacing only as a flaky cluster run or not at all.
 func TestContractEnvVars(t *testing.T) {
 	// A duplicate would be masked by the set comparison below, so catch it first.
 	seen := map[string]bool{}
-	for _, n := range ContractEnvVars {
+	for _, n := range contractEnvVars {
 		if seen[n] {
-			t.Errorf("ContractEnvVars contains duplicate %q", n)
+			t.Errorf("contractEnvVars contains duplicate %q", n)
 		}
 		seen[n] = true
 	}
 
 	want := envNameSet(goldenContractEnvVars)
-	got := envNameSet(ContractEnvVars)
+	got := envNameSet(contractEnvVars)
 
 	for n := range want {
 		if !got[n] {
-			t.Errorf("ContractEnvVars is missing %q that func emits; if the name was intentionally renamed or dropped, update ContractEnvVars AND knative/func's kafkaRuntimeContractEnvNames together", n)
+			t.Errorf("contractEnvVars is missing %q that func emits; if the name was intentionally renamed or dropped, update contractEnvVars AND knative/func's kafkaRuntimeContractEnvNames together", n)
 		}
 	}
 	for n := range got {
 		if !want[n] {
-			t.Errorf("ContractEnvVars reads %q that func does not emit; add it to knative/func's kafkaRuntimeContractEnvNames, or move it to the adapter-only env vars in contract.go", n)
+			t.Errorf("contractEnvVars reads %q that func does not emit; add it to knative/func's kafkaRuntimeContractEnvNames, or move it to the adapter-only env vars in contract.go", n)
 		}
 	}
 }
