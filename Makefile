@@ -22,13 +22,16 @@ test:
 
 ## test-e2e: run the real-broker delivery/retry E2E suite (build tag: e2e).
 ## Requires a reachable Kafka: set KAFKA_E2E_BOOTSTRAP to its bootstrap address
-## (e.g. localhost:9092). Without it the suite skips rather than fails.
+## (e.g. localhost:9092). Without it the suite skips rather than fails. Run with the
+## race detector: this is the only suite that exercises the real shutdown/consumeDone
+## and sarama consumer-group concurrency.
 test-e2e:
-	go test -tags e2e -count=1 -timeout 15m ./kafka/ -run '^TestE2E'
+	go test -tags e2e -race -count=1 -timeout 15m ./kafka/ -run '^TestE2E'
 
-## vet: run go vet
+## vet: run go vet, including the e2e-tagged files (the default build excludes them).
 vet:
 	go vet ./...
+	go vet -tags e2e ./...
 
 ## fmt: check formatting (fails if any file needs gofmt)
 fmt:

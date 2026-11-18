@@ -20,6 +20,9 @@ package kafka
 
 import (
 	"context"
+	"errors"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -46,7 +49,6 @@ func TestE2E_HappyPath(t *testing.T) {
 
 	rs := h.startService(t, fs.url(), nil)
 	rs.waitReady(t, readyTimeout)
-	h.settle()
 
 	values := []string{"r0", "r1", "r2", "r3", "r4"}
 	h.produce(values...)
@@ -65,7 +67,8 @@ func TestE2E_HappyPath(t *testing.T) {
 	if !ok {
 		t.Fatal("no delivery recorded for r0")
 	}
-	assertBinaryCloudEvent(t, h, rec, "r0")
+	// r0 is the first record on the fresh single-partition topic (seeded at 0).
+	assertBinaryCloudEvent(t, h, rec, "r0", 0)
 	waitFor(t, commitTimeout, "offsets committed (zero lag)", func() bool {
 		return h.lag() == 0
 	})
@@ -93,7 +96,6 @@ func TestE2E_BoundedRetriesExhaustion(t *testing.T) {
 		envFunctionDeliveryBackoffMax: "50ms",
 	})
 	rs.waitReady(t, readyTimeout)
-	h.settle()
 
 	h.produce("good-before", "poison", "good-after")
 
@@ -102,13 +104,12 @@ func TestE2E_BoundedRetriesExhaustion(t *testing.T) {
 	waitFor(t, deliverTimeout, "poison attempted up to its budget", func() bool {
 		return fs.attempts("poison") >= 3
 	})
+	// A partition is consumed one record at a time -- the handler blocks in deliver
+	// until poison is skipped -- so good-after cannot arrive until poison is done.
+	// Once it has, poison's attempt count is final; no extra wait is needed.
 	waitFor(t, deliverTimeout, "good-after delivered past skipped poison", func() bool {
 		return fs.attempts("good-after") >= 1
 	})
-
-	// Give any erroneous extra retry a chance to land before asserting the exact
-	// count: retry=2 must mean exactly 3 attempts, no more.
-	time.Sleep(1 * time.Second)
 	if got := fs.attempts("poison"); got != 3 {
 		t.Errorf("poison attempted %d times, want exactly 3 (retry=2 => 3 attempts)", got)
 	}
@@ -126,7 +127,11 @@ func TestE2E_BoundedRetriesExhaustion(t *testing.T) {
 // and is redelivered until the function recovers, at which point it is committed.
 func TestE2E_UnlimitedRetriesDefault(t *testing.T) {
 	h := newHarness(t)
-	const failUntil = 3
+	// Keep failing for many attempts over a window longer than sarama's ~1s
+	// auto-commit interval, so this tells unlimited apart from any finite budget (not
+	// just budgets under 4) and the lag check below cannot pass merely because a
+	// wrongly-marked offset has not been flushed yet.
+	const failUntil = 12
 	fs := newFuncServer(t, func(body string, n int) (int, time.Duration) {
 		if body == "recover" && n <= failUntil {
 			return 503, 0
@@ -136,24 +141,25 @@ func TestE2E_UnlimitedRetriesDefault(t *testing.T) {
 
 	rs := h.startService(t, fs.url(), map[string]string{
 		// No FUNCTION_DELIVERY_RETRY => unlimited.
-		envFunctionDeliveryBackoffDel: "50ms",
-		envFunctionDeliveryBackoffMax: "100ms",
+		envFunctionDeliveryBackoffDel: "100ms",
+		envFunctionDeliveryBackoffMax: "200ms",
 	})
 	rs.waitReady(t, readyTimeout)
-	h.settle()
 
 	h.produce("recover")
 
-	// While the function is still rejecting it, the record is retried but never
-	// committed: the single produced record remains as lag.
-	waitFor(t, deliverTimeout, "record retried while function fails", func() bool {
-		return fs.attempts("recover") >= 2
+	// Retry ~10 times at ~200ms backoff (~2s), crossing the auto-commit interval
+	// while the function keeps rejecting the record. A finite budget of fewer than 4
+	// retries would have given up by now; unlimited keeps going.
+	waitFor(t, deliverTimeout, "record retried ~10 times while function fails", func() bool {
+		return fs.attempts("recover") >= 10
 	})
-	if lag := h.lag(); lag == 0 {
-		t.Error("offset committed while delivery still failing; unlimited retries must not commit an unacked record")
+	if lag := h.lag(); lag < 1 {
+		t.Errorf("lag=%d while delivery still failing; unlimited retries must not commit an unacked record", lag)
 	}
 
-	// Once the function starts accepting it, the record is delivered and committed.
+	// Once the function starts accepting it (after failUntil), the record is delivered
+	// and committed.
 	waitFor(t, deliverTimeout, "record delivered after function recovers", func() bool {
 		return fs.attempts("recover") > failUntil
 	})
@@ -189,7 +195,6 @@ func TestE2E_OffsetSafetyRedelivery(t *testing.T) {
 	// "pending" (offset 1) under unlimited retries.
 	rs := h.startService(t, fs.url(), extraEnv)
 	rs.waitReady(t, readyTimeout)
-	h.settle()
 
 	h.produce("committed")
 	waitFor(t, deliverTimeout, "committed record acked", func() bool {
@@ -263,7 +268,6 @@ func TestE2E_Backoff(t *testing.T) {
 			envFunctionDeliveryBackoffMax: "10s",
 		})
 		rs.waitReady(t, readyTimeout)
-		h.settle()
 		h.produce("retryme")
 		waitFor(t, deliverTimeout, "record retried past the failing attempts", func() bool {
 			return fs.attempts("retryme") >= failUntil+1
@@ -272,18 +276,28 @@ func TestE2E_Backoff(t *testing.T) {
 		if len(gaps) < 3 {
 			t.Fatalf("got %d gaps, want >= 3", len(gaps))
 		}
+		// The 800ms lower bound on gap 3 also rules out linear growth (which would
+		// give 600ms there), so this subtest fails if the runtime ignored the policy
+		// and used linear.
 		assertAtLeast(t, "gap 1", gaps[0], 200*time.Millisecond)
 		assertAtLeast(t, "gap 2", gaps[1], 400*time.Millisecond)
 		assertAtLeast(t, "gap 3", gaps[2], 800*time.Millisecond)
 		if !(gaps[1] > gaps[0] && gaps[2] > gaps[1]) {
 			t.Errorf("gaps not growing exponentially: %v", gaps)
 		}
-		_ = rs.stop(t)
+		if err := rs.stop(t); err != nil {
+			t.Errorf("service returned error on stop: %v", err)
+		}
 	})
 
 	t.Run("linear", func(t *testing.T) {
 		h := newHarness(t)
-		const failUntil = 3
+		// Fail enough attempts that linear and exponential diverge widely: linear
+		// gives 150/300/450/600/750ms, exponential 150/300/600/1200/2400ms. Lower
+		// bounds alone cannot tell them apart (exponential clears every linear lower
+		// bound), so the wide upper bound on the last gap below is what proves the
+		// runtime used linear and not exponential.
+		const failUntil = 5
 		fs := newFuncServer(t, func(body string, n int) (int, time.Duration) {
 			if body == "retryme" && n <= failUntil {
 				return 500, 0
@@ -296,22 +310,31 @@ func TestE2E_Backoff(t *testing.T) {
 			envFunctionDeliveryBackoffMax: "10s",
 		})
 		rs.waitReady(t, readyTimeout)
-		h.settle()
 		h.produce("retryme")
 		waitFor(t, deliverTimeout, "record retried past the failing attempts", func() bool {
 			return fs.attempts("retryme") >= failUntil+1
 		})
 		gaps := fs.gaps("retryme")
-		if len(gaps) < 3 {
-			t.Fatalf("got %d gaps, want >= 3", len(gaps))
+		if len(gaps) < failUntil {
+			t.Fatalf("got %d gaps, want >= %d", len(gaps), failUntil)
 		}
 		assertAtLeast(t, "gap 1", gaps[0], 150*time.Millisecond)
 		assertAtLeast(t, "gap 2", gaps[1], 300*time.Millisecond)
 		assertAtLeast(t, "gap 3", gaps[2], 450*time.Millisecond)
-		if !(gaps[1] > gaps[0] && gaps[2] > gaps[1]) {
-			t.Errorf("gaps not growing linearly: %v", gaps)
+		assertAtLeast(t, "gap 4", gaps[3], 600*time.Millisecond)
+		assertAtLeast(t, "gap 5", gaps[4], 750*time.Millisecond)
+		if !(gaps[1] > gaps[0] && gaps[2] > gaps[1] && gaps[3] > gaps[2] && gaps[4] > gaps[3]) {
+			t.Errorf("gaps not growing monotonically: %v", gaps)
 		}
-		_ = rs.stop(t)
+		// Linear's 5th gap is ~750ms; exponential's would be ~2400ms. A wide upper
+		// bound here (room for scheduling jitter, which only adds time) fails if the
+		// runtime grew the backoff exponentially instead of linearly.
+		if gaps[4] >= 1500*time.Millisecond {
+			t.Errorf("gap 5 = %s looks exponential, not linear (linear expects ~750ms): %v", gaps[4], gaps)
+		}
+		if err := rs.stop(t); err != nil {
+			t.Errorf("service returned error on stop: %v", err)
+		}
 	})
 
 	t.Run("maxDelayCap", func(t *testing.T) {
@@ -329,7 +352,6 @@ func TestE2E_Backoff(t *testing.T) {
 			envFunctionDeliveryBackoffMax: "400ms", // caps at 400ms; uncapped would reach 1600ms+
 		})
 		rs.waitReady(t, readyTimeout)
-		h.settle()
 		h.produce("retryme")
 		waitFor(t, deliverTimeout, "record retried past the failing attempts", func() bool {
 			return fs.attempts("retryme") >= failUntil+1
@@ -356,7 +378,9 @@ func TestE2E_Backoff(t *testing.T) {
 				t.Errorf("gap %d = %s is not capped: with a 400ms cap it must stay well below its uncapped value (>=1600ms)", i+1, gaps[i])
 			}
 		}
-		_ = rs.stop(t)
+		if err := rs.stop(t); err != nil {
+			t.Errorf("service returned error on stop: %v", err)
+		}
 	})
 }
 
@@ -381,7 +405,6 @@ func TestE2E_PerAttemptTimeout(t *testing.T) {
 		envFunctionDeliveryBackoffMax: "50ms",
 	})
 	rs.waitReady(t, readyTimeout)
-	h.settle()
 
 	h.produce("slow")
 
@@ -417,16 +440,15 @@ func TestE2E_ZeroRetriesSingleAttempt(t *testing.T) {
 		envFunctionDeliveryRetry: "0", // single attempt
 	})
 	rs.waitReady(t, readyTimeout)
-	h.settle()
 
 	h.produce("good0", "poison", "good1")
 
+	// good1 (produced after poison) can only be delivered once poison's single
+	// attempt is done and its offset committed -- the partition is consumed one
+	// record at a time -- so poison's count is final here; no extra wait is needed.
 	waitFor(t, deliverTimeout, "poison attempted and good1 delivered", func() bool {
 		return fs.attempts("poison") >= 1 && fs.attempts("good1") >= 1
 	})
-
-	// No retry: let any erroneous second attempt land before asserting the count.
-	time.Sleep(1 * time.Second)
 	if got := fs.attempts("poison"); got != 1 {
 		t.Errorf("poison attempted %d times, want exactly 1 (retry=0 => single attempt)", got)
 	}
@@ -446,10 +468,9 @@ func TestE2E_RestartDurability(t *testing.T) {
 	h := newHarness(t)
 	fs := newFuncServer(t, alwaysOK)
 
-	// First session: deliver and commit a, b, c.
+	// First session: deliver and commit a, b, c (offsets 0-2 => committed offset 3).
 	rs := h.startService(t, fs.url(), nil)
 	rs.waitReady(t, readyTimeout)
-	h.settle()
 	h.produce("a", "b", "c")
 	waitFor(t, deliverTimeout, "first batch delivered", func() bool {
 		return fs.totalRequests() >= 3
@@ -461,13 +482,19 @@ func TestE2E_RestartDurability(t *testing.T) {
 		t.Errorf("service returned error on first stop: %v", err)
 	}
 
-	// Second session on the same group: produce d, e. The committed records must
-	// not reappear; the new records must be delivered.
+	// Produce d, e (offsets 3, 4) while NO consumer is running. A consumer that
+	// resumes from the committed offset (3) delivers them; one that ignored the commit
+	// and started at OffsetNewest would set its position to the high-water mark (5) and
+	// never deliver d, e. Producing before the restart is what makes this prove the
+	// resume -- producing after the second consumer is ready would be delivered either
+	// way.
+	h.produce("d", "e")
+
+	// Second session on the same group must resume from offset 3 and deliver d, e,
+	// while the committed a, b, c must not reappear.
 	rs2 := h.startService(t, fs.url(), nil)
 	rs2.waitReady(t, readyTimeout)
-	h.settle()
-	h.produce("d", "e")
-	waitFor(t, deliverTimeout, "new records delivered after restart", func() bool {
+	waitFor(t, deliverTimeout, "records produced before restart delivered from committed offset", func() bool {
 		return fs.successes("d") >= 1 && fs.successes("e") >= 1
 	})
 	waitFor(t, commitTimeout, "new records committed (zero lag)", func() bool {
@@ -484,40 +511,123 @@ func TestE2E_RestartDurability(t *testing.T) {
 	}
 }
 
-// TestE2E_InvalidConfigFailsFast (scenario 9): an invalid FUNCTION_DELIVERY_*
-// value is rejected at startup -- before the function-target wait -- so the
-// process exits promptly rather than running with a silently ignored setting.
+// TestE2E_RebalanceDurability (scenario 8, rebalance half): while a record is failing
+// under unlimited retries, a second Service joins the same group and forces a
+// rebalance of the single partition -- exercising two paths reachable only through a
+// real group rebalance: the consume-loop re-entry (client.Consume returning and being
+// called again) and the deliveryAborted path on partition revocation. Across the
+// rebalance the unacked record's offset must not advance; once the function accepts
+// it, it is delivered and committed.
+func TestE2E_RebalanceDurability(t *testing.T) {
+	h := newHarness(t)
+	var failRec atomic.Bool
+	failRec.Store(true)
+	fs := newFuncServer(t, func(body string, _ int) (int, time.Duration) {
+		if body == "rebal" && failRec.Load() {
+			return 500, 0
+		}
+		return 200, 0
+	})
+	// No FUNCTION_DELIVERY_RETRY => unlimited, so the record keeps being retried across
+	// the rebalance rather than being skipped and committed.
+	extraEnv := map[string]string{
+		envFunctionDeliveryBackoffDel: "50ms",
+		envFunctionDeliveryBackoffMax: "50ms",
+	}
+
+	// Member A joins alone and starts retrying the failing record.
+	rsA := h.startService(t, fs.url(), extraEnv)
+	rsA.waitReady(t, readyTimeout)
+	h.produce("rebal")
+	waitFor(t, deliverTimeout, "record retried by the first member while failing", func() bool {
+		return fs.attempts("rebal") >= 2
+	})
+
+	// Member B joins the same group, forcing a rebalance of partition 0.
+	rsB := h.startService(t, fs.url(), extraEnv)
+	rsB.waitReady(t, readyTimeout)
+
+	// The record never succeeded, so across the rebalance its offset must not advance
+	// past the seeded start (0). A committed offset > 0 would mean an unacked record
+	// was marked.
+	if got := h.committedOffset(); got > 0 {
+		t.Errorf("committed offset=%d for a never-acked record across a rebalance; want <= 0 (nothing committed)", got)
+	}
+
+	// Let whichever member now owns the partition deliver it successfully.
+	failRec.Store(false)
+	waitFor(t, deliverTimeout, "record acked after rebalance", func() bool {
+		return fs.successes("rebal") >= 1
+	})
+	waitFor(t, commitTimeout, "offset committed after rebalance (zero lag)", func() bool {
+		return h.lag() == 0
+	})
+
+	if err := rsB.stop(t); err != nil {
+		t.Errorf("service returned error on stop (member B): %v", err)
+	}
+	if err := rsA.stop(t); err != nil {
+		t.Errorf("service returned error on stop (member A): %v", err)
+	}
+
+	// The record was rejected until after the rebalance settled, so exactly one member
+	// delivered it successfully -- no duplicate ack despite the at-least-once churn.
+	if got := fs.successes("rebal"); got != 1 {
+		t.Errorf("record acked %d times; want exactly 1 across the rebalance", got)
+	}
+}
+
+// TestE2E_InvalidConfigFailsFast (scenario 9): an invalid FUNCTION_DELIVERY_* value
+// is rejected at the PROCESS level -- the built runtime binary exits non-zero with a
+// message naming the offending variable, before the function-target wait. Running the
+// real binary is what distinguishes this from the loader unit tests (which already
+// cover the negative-value rejection via an in-process call) and answers #30's "confirm
+// at the process level".
 func TestE2E_InvalidConfigFailsFast(t *testing.T) {
-	// Gated on a broker only to keep the whole suite behind one switch; this
-	// scenario fails before any broker connection is attempted.
+	// Gated on a broker only to keep the whole suite behind one switch; this scenario
+	// never connects to a broker (it fails on config first).
 	requireBrokers(t)
 
-	t.Setenv(envKafkaBrokers, "localhost:9092")
-	t.Setenv(envKafkaTopic, "irrelevant")
-	t.Setenv(envKafkaConsumerGroup, "irrelevant")
-	// Unlimited is expressed by omitting the variable; a negative value is a typo
-	// the runtime must reject rather than silently treat as "retry forever".
-	t.Setenv(envFunctionDeliveryRetry, "-1")
-
-	svc, err := New("http://127.0.0.1:1/")
-	if err != nil {
-		t.Fatalf("creating service: %v", err)
+	// Build the runtime binary from the module root (the test runs in ./kafka).
+	bin := filepath.Join(t.TempDir(), "fkafka-runtime")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/fkafka-runtime")
+	build.Dir = ".."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building fkafka-runtime: %v\n%s", err, out)
 	}
-	// Long target wait: if the bad config were not caught first, Start would block
-	// here, and the elapsed-time check below would fail.
-	svc.targetWaitTimeout = 30 * time.Second
+
+	// Run with a controlled env (not os.Environ) so an inherited FUNCTION_* value
+	// cannot make the process fail for the wrong reason. Unlimited is expressed by
+	// omitting FUNCTION_DELIVERY_RETRY; a negative value is a typo the runtime must
+	// reject rather than silently treat as "retry forever".
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin)
+	cmd.Env = []string{
+		envKafkaBrokers + "=localhost:9092",
+		envKafkaTopic + "=irrelevant",
+		envKafkaConsumerGroup + "=irrelevant",
+		envFunctionDeliveryRetry + "=-1",
+	}
 
 	start := time.Now()
-	err = svc.Start(context.Background())
+	out, err := cmd.CombinedOutput()
 	elapsed := time.Since(start)
 
-	if err == nil {
-		t.Fatal("Start returned nil; expected it to reject the invalid FUNCTION_DELIVERY_RETRY")
+	if ctx.Err() != nil {
+		t.Fatalf("process did not exit within the timeout; it must fail fast on bad config. output:\n%s", out)
 	}
-	if !strings.Contains(err.Error(), "FUNCTION_DELIVERY_RETRY") {
-		t.Errorf("error %q does not mention the offending variable FUNCTION_DELIVERY_RETRY", err)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("process did not exit non-zero (err=%v); want rejection of the invalid config. output:\n%s", err, out)
 	}
-	if elapsed > 5*time.Second {
-		t.Errorf("Start took %s to reject bad config; it must fail before the %s target wait", elapsed, svc.targetWaitTimeout)
+	if code := exitErr.ExitCode(); code != 1 {
+		t.Errorf("process exit code = %d, want 1. output:\n%s", code, out)
+	}
+	if !strings.Contains(string(out), "FUNCTION_DELIVERY_RETRY") {
+		t.Errorf("process output does not name the offending variable FUNCTION_DELIVERY_RETRY:\n%s", out)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("process took %s to reject bad config; it must fail before the function-target wait", elapsed)
 	}
 }

@@ -29,9 +29,9 @@ limitations under the License.
 // public entry point (New + Start) pointed at a scripted HTTP function, and
 // assert on committed offsets, consumer lag, and per-record delivery attempts.
 //
-// The suite does not stand up a broker itself (see the chosen design): point it
-// at any Kafka -- a local container, docker-compose, or a Strimzi cluster -- via
-// KAFKA_E2E_BOOTSTRAP, and run `make test-e2e`.
+// The suite does not stand up a broker itself: point it at any Kafka -- a local
+// container, docker-compose, or a Strimzi cluster -- via KAFKA_E2E_BOOTSTRAP, and
+// run `make test-e2e`.
 package kafka
 
 import (
@@ -55,8 +55,10 @@ import (
 const bootstrapEnv = "KAFKA_E2E_BOOTSTRAP"
 
 // Env var names the runtime reads. Duplicated here as literals rather than
-// imported, so the suite builds against main (which reads these as literals) and
-// does not depend on the separate env-name-constant refactor.
+// imported so the suite builds against main, where the runtime reads these as
+// literals too. TODO: once the env-name-constant refactor
+// (knative-extensions/func-adapter-kafka#34) merges, replace these with the Env*
+// constants so there is a single source for the names.
 const (
 	envKafkaBrokers               = "KAFKA_BROKERS"
 	envKafkaTopic                 = "KAFKA_TOPIC"
@@ -67,33 +69,34 @@ const (
 	envFunctionDeliveryBackoffDel = "FUNCTION_DELIVERY_BACKOFF_DELAY"
 	envFunctionDeliveryBackoffMax = "FUNCTION_DELIVERY_BACKOFF_MAX_DELAY"
 	envFunctionRequestTimeout     = "FUNCTION_REQUEST_TIMEOUT"
+	envFunctionMaxConcurrency     = "FUNCTION_MAX_CONCURRENCY"
 )
 
-// runtimeOverrideEnvVars are the delivery/timeout variables a scenario drives via
-// extraEnv. startService clears any inherited value before applying the scenario's
-// own, so a value already in the caller's environment (CI, a developer shell)
-// cannot leak in and silently change a scenario -- e.g. an inherited
+// runtimeOverrideEnvVars are the delivery/timeout/concurrency variables a scenario
+// drives via extraEnv. startService clears any inherited value before applying the
+// scenario's own, so a value already in the caller's environment (CI, a developer
+// shell) cannot leak in and silently change a scenario -- e.g. an inherited
 // FUNCTION_DELIVERY_RETRY would corrupt the unlimited-retry default scenario, and
-// an inherited invalid FUNCTION_REQUEST_TIMEOUT would make New fail before the test
-// even runs.
+// an inherited invalid FUNCTION_REQUEST_TIMEOUT or FUNCTION_MAX_CONCURRENCY would
+// make New fail before the test even runs.
 var runtimeOverrideEnvVars = []string{
 	envFunctionDeliveryRetry,
 	envFunctionDeliveryBackoffPol,
 	envFunctionDeliveryBackoffDel,
 	envFunctionDeliveryBackoffMax,
 	envFunctionRequestTimeout,
+	envFunctionMaxConcurrency,
 }
 
-// settleAfterReady is a short pause between the consumer reporting ready
-// (partitions assigned) and the test producing records. The runtime consumes
-// from OffsetNewest, so a record produced before the fetch position is
-// established would be skipped; the settle closes that race without coupling the
-// test to sarama internals. Kept small so it adds little to each scenario.
-const settleAfterReady = 1 * time.Second
+// runID distinguishes topic and consumer-group names across separate `go test`
+// runs against the same (possibly long-lived) broker, so a run that was killed
+// before its cleanup ran cannot collide with a later run on the same name
+// (admin.CreateTopic would otherwise fail with TopicAlreadyExists).
+var runID = strconv.FormatInt(time.Now().UnixNano(), 36)
 
-// topicSeq makes topic/group names unique across scenarios in one run. The
+// topicSeq makes topic/group names unique across scenarios within one run. The
 // suite is strictly sequential (t.Setenv forbids parallel tests), so a plain
-// counter suffices and keeps names deterministic.
+// counter suffices.
 var topicSeq int64
 
 // requireBrokers returns the configured bootstrap brokers or skips the test.
@@ -106,8 +109,8 @@ func requireBrokers(t *testing.T) []string {
 	return splitAndTrim(v)
 }
 
-// uniqueName builds a broker-safe, collision-free name from the test name and a
-// per-run counter.
+// uniqueName builds a broker-safe, collision-free name from the test name, a
+// per-process run ID, and a per-run counter.
 func uniqueName(t *testing.T, prefix string) string {
 	n := atomic.AddInt64(&topicSeq, 1)
 	safe := strings.Map(func(r rune) rune {
@@ -118,7 +121,7 @@ func uniqueName(t *testing.T, prefix string) string {
 			return '-'
 		}
 	}, t.Name())
-	return prefix + "-" + safe + "-" + strconv.FormatInt(n, 10)
+	return prefix + "-" + safe + "-" + runID + "-" + strconv.FormatInt(n, 10)
 }
 
 // harness owns the broker-side fixtures for one scenario: a dedicated topic and
@@ -188,11 +191,45 @@ func newHarness(t *testing.T) *harness {
 	}
 	t.Cleanup(func() {
 		_ = producer.Close()
+		// Delete the consumer group so a long-lived broker (docker-compose, Strimzi)
+		// does not accumulate a grp-* entry per scenario. Safe here because harness
+		// cleanup runs after the per-service cleanups (t.Cleanup is LIFO), so the
+		// group has no remaining members by now.
+		_ = admin.DeleteConsumerGroup(h.group)
 		_ = client.Close()
 		_ = admin.DeleteTopic(topic)
 		_ = admin.Close()
 	})
+	h.seedStartOffset()
 	return h
+}
+
+// seedStartOffset commits a starting offset of 0 for the harness group on partition
+// 0 before any consumer joins. The runtime consumes from OffsetNewest, which for a
+// group with no committed offset would skip any record produced before the consumer
+// finishes resolving its start position -- a real race the suite otherwise has to
+// paper over with a fixed sleep. Committing 0 up front makes the runtime resume from
+// the beginning deterministically, so records may be produced at any time (before or
+// after the consumer is ready) and none is skipped.
+func (h *harness) seedStartOffset() {
+	h.t.Helper()
+	om, err := sarama.NewOffsetManagerFromClient(h.group, h.client)
+	if err != nil {
+		h.t.Fatalf("creating offset manager: %v", err)
+	}
+	defer func() { _ = om.Close() }()
+	pom, err := om.ManagePartition(h.topic, 0)
+	if err != nil {
+		h.t.Fatalf("managing partition offset: %v", err)
+	}
+	defer func() { _ = pom.Close() }()
+	// MarkOffset sets the next offset to consume. 0 means "start from the first
+	// record". ResetOffset as well, in case the partition manager initialized its
+	// position at the high-water mark (OffsetNewest), which MarkOffset alone would
+	// not move backward from.
+	pom.MarkOffset(0, "")
+	pom.ResetOffset(0, "")
+	om.Commit()
 }
 
 // produce sends each value as a record to the harness topic, in order.
@@ -247,9 +284,11 @@ func (h *harness) lag() int64 {
 // runningService is a Service started in the background, stoppable by cancelling
 // its context (which triggers the runtime's clean consumer-group close).
 type runningService struct {
-	svc    *Service
-	errc   chan error
-	cancel context.CancelFunc
+	svc      *Service
+	errc     chan error
+	cancel   context.CancelFunc
+	stopOnce sync.Once
+	stopErr  error
 }
 
 // startService configures the runtime's env from the harness, applies any extra
@@ -283,7 +322,14 @@ func (h *harness) startService(t *testing.T, target string, extraEnv map[string]
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
 	go func() { errc <- svc.Start(ctx) }()
-	return &runningService{svc: svc, errc: errc, cancel: cancel}
+	rs := &runningService{svc: svc, errc: errc, cancel: cancel}
+	// Ensure the Service is always torn down, even when a waitFor failure aborts the
+	// scenario with t.Fatal before it reaches an explicit stop -- otherwise the
+	// consumer and health server keep running after their topic is deleted and their
+	// function server is closed, and their errors land in later tests' logs. stop is
+	// idempotent (sync.Once), so an explicit stop still works.
+	t.Cleanup(func() { _ = rs.stop(t) })
+	return rs
 }
 
 // waitReady blocks until the consumer reports ready (partitions assigned).
@@ -295,26 +341,28 @@ func (rs *runningService) waitReady(t *testing.T, timeout time.Duration) {
 }
 
 // stop cancels the service context and waits for Start to return, which includes
-// the runtime's clean consumer-group close (committing final offsets). It
-// returns Start's error.
+// the runtime's clean consumer-group close (committing final offsets). It returns
+// Start's error. It is idempotent: the registered t.Cleanup also calls it, and any
+// call after the first returns the first result without blocking.
 func (rs *runningService) stop(t *testing.T) error {
 	t.Helper()
-	rs.cancel()
-	select {
-	case err := <-rs.errc:
-		return err
-	case <-time.After(45 * time.Second):
-		t.Fatal("service did not stop within 45s of context cancel")
-		return nil
-	}
+	rs.stopOnce.Do(func() {
+		rs.cancel()
+		select {
+		case rs.stopErr = <-rs.errc:
+		case <-time.After(45 * time.Second):
+			t.Error("service did not stop within 45s of context cancel")
+		}
+	})
+	return rs.stopErr
 }
 
 // funcServer is a scripted HTTP CloudEvents receiver standing in for the user
 // function. Each delivery arrives as a binary-mode CloudEvent whose body is the
 // raw record value, so scenarios key their response script on the produced
-// string. Every request is recorded (arrival time, 1-based attempt number for
-// that body, and the status returned) for assertions on attempt counts, ordering
-// and backoff timing.
+// string. Every request is recorded (arrival time, the status returned, the
+// request headers, and whether the client abandoned the attempt) for assertions on
+// attempt counts, ordering, backoff timing, and CloudEvent metadata.
 type funcServer struct {
 	srv     *httptest.Server
 	respond func(body string, attempt int) (status int, delay time.Duration)
@@ -325,11 +373,15 @@ type funcServer struct {
 }
 
 type reqRecord struct {
-	body    string
-	attempt int
-	at      time.Time
-	status  int
-	header  http.Header
+	body   string
+	at     time.Time
+	status int
+	header http.Header
+	// abandoned is true when the client (the runtime) gave up on the attempt before
+	// the handler responded -- i.e. the request context was cancelled during the
+	// scripted delay, as a per-attempt timeout does. Such an attempt is not a
+	// delivered ack even if its scripted status is 2xx.
+	abandoned bool
 }
 
 // newFuncServer starts a scripted receiver. respond is called per request with
@@ -355,13 +407,27 @@ func newFuncServer(t *testing.T, respond func(body string, attempt int) (status 
 
 		status, delay := fs.respond(body, n)
 
+		// Append in arrival order (before the scripted delay) so gaps()/arrivals()
+		// stay ordered even when a slow handler is still sleeping as the next retry
+		// arrives.
 		fs.mu.Lock()
-		fs.log = append(fs.log, reqRecord{body: body, attempt: n, at: at, status: status, header: hdr})
+		idx := len(fs.log)
+		fs.log = append(fs.log, reqRecord{body: body, at: at, status: status, header: hdr})
 		fs.mu.Unlock()
 
 		if delay > 0 {
 			time.Sleep(delay)
 		}
+		// If the client gave up on this attempt before we responded -- e.g. a
+		// per-attempt timeout elapsed during the delay above -- its request context is
+		// cancelled. Mark the attempt abandoned so successes() does not count a 2xx the
+		// runtime never actually received.
+		if r.Context().Err() != nil {
+			fs.mu.Lock()
+			fs.log[idx].abandoned = true
+			fs.mu.Unlock()
+		}
+
 		w.WriteHeader(status)
 	}))
 	t.Cleanup(fs.srv.Close)
@@ -378,13 +444,15 @@ func (fs *funcServer) attempts(body string) int {
 	return fs.counts[body]
 }
 
-// successes returns how many deliveries of body were answered with a 2xx.
+// successes returns how many deliveries of body the runtime actually received as a
+// 2xx ack -- i.e. 2xx responses the client did not abandon first (a timed-out
+// attempt whose handler later returns 200 does not count).
 func (fs *funcServer) successes(body string) int {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	n := 0
 	for _, r := range fs.log {
-		if r.body == body && r.status >= 200 && r.status < 300 {
+		if r.body == body && !r.abandoned && r.status >= 200 && r.status < 300 {
 			n++
 		}
 	}
@@ -456,35 +524,36 @@ func waitFor(t *testing.T, timeout time.Duration, desc string, cond func() bool)
 	}
 }
 
-// settle pauses briefly after readiness before producing (see settleAfterReady).
-func (h *harness) settle() { time.Sleep(settleAfterReady) }
-
-// assertBinaryCloudEvent verifies a delivery carried the binary-mode CloudEvent
-// the runtime maps a plain (non-CloudEvent) Kafka record to -- see
-// kafkaMessageToEvent. The context attributes travel as Ce-* HTTP headers and the
-// record value is the body with an application/octet-stream content type. This
-// proves scenario 1's CloudEvent mapping end to end: a regression in
-// kafkaMessageToEvent or the binary encoding would otherwise pass a body-only
-// check. The event ID embeds the partition/offset, which vary, so it is matched by
-// shape rather than exact value.
-func assertBinaryCloudEvent(t *testing.T, h *harness, rec reqRecord, wantBody string) {
+// assertBinaryCloudEvent verifies a delivery carried the binary-mode CloudEvent the
+// runtime maps a plain (non-CloudEvent) Kafka record to -- see kafkaMessageToEvent.
+// The context attributes travel as Ce-* HTTP headers and the record value is the
+// body with an application/octet-stream content type. This proves scenario 1's
+// CloudEvent mapping end to end: a regression in kafkaMessageToEvent or the binary
+// encoding would otherwise pass a body-only check. wantOffset is the record's Kafka
+// offset, which the runtime encodes into the event ID and the kafka* extensions; the
+// caller knows it because each scenario produces to a fresh single-partition topic
+// seeded at offset 0. Asserting the exact offset also covers the
+// offset-as-decimal-string encoding (kafkaoffset), a prior fix nothing else verifies
+// end to end.
+func assertBinaryCloudEvent(t *testing.T, h *harness, rec reqRecord, wantBody string, wantOffset int64) {
 	t.Helper()
 	if rec.body != wantBody {
 		t.Errorf("delivered body = %q, want %q", rec.body, wantBody)
 	}
+	off := strconv.FormatInt(wantOffset, 10)
 	checks := map[string]string{
-		"Ce-Specversion": "1.0",
-		"Ce-Type":        "dev.knative.kafka.event",
-		"Ce-Source":      "kafka://" + strings.Join(h.brokers, ",") + "/" + h.topic,
-		"Ce-Kafkatopic":  h.topic,
-		"Content-Type":   "application/octet-stream",
+		"Ce-Specversion":    "1.0",
+		"Ce-Type":           "dev.knative.kafka.event",
+		"Ce-Source":         "kafka://" + strings.Join(h.brokers, ",") + "/" + h.topic,
+		"Ce-Id":             "partition:0/offset:" + off,
+		"Ce-Kafkatopic":     h.topic,
+		"Ce-Kafkapartition": "0",
+		"Ce-Kafkaoffset":    off,
+		"Content-Type":      "application/octet-stream",
 	}
 	for header, want := range checks {
 		if got := rec.header.Get(header); got != want {
 			t.Errorf("delivered %s = %q, want %q", header, got, want)
 		}
-	}
-	if got := rec.header.Get("Ce-Id"); !strings.HasPrefix(got, "partition:0/offset:") {
-		t.Errorf("delivered Ce-Id = %q, want it to encode partition 0 and an offset (partition:0/offset:<n>)", got)
 	}
 }

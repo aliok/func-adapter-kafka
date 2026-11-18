@@ -65,3 +65,7 @@ jobs:
         env:
           KAFKA_E2E_BOOTSTRAP: localhost:9092
         run: make test-e2e
+
+      - name: Dump broker logs on failure
+        if: failure()
+        run: docker logs kafka
