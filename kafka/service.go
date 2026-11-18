@@ -128,7 +128,8 @@ func (s *Service) Start(ctx context.Context) (err error) {
 	}
 	s.setListener(listener)
 
-	s.handleSignals()
+	stopSignals := s.handleSignals()
+	defer stopSignals()
 
 	// Serve health immediately -- before waiting for the function target -- so the
 	// runtime reports liveness (ALIVE) throughout a slow function cold start.
@@ -212,7 +213,14 @@ func (s *Service) Alive(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "ALIVE")
 }
 
-func (s *Service) handleSignals() {
+// handleSignals registers a SIGINT/SIGTERM handler that stops the Service, and
+// returns a function that unregisters it. The caller must invoke the returned
+// function when Start returns: otherwise signal.Notify stays registered for the whole
+// process even after this Service has stopped, and because the first registration
+// diverts SIGINT/SIGTERM away from Go's default terminate behavior, a later Ctrl-C
+// would no longer stop the process. This matters when more than one Service runs in
+// the same process (e.g. sequential tests).
+func (s *Service) handleSignals() func() {
 	// Only intercept the termination signals we act on. Passing no signals to
 	// signal.Notify would capture every catchable signal and suppress the default
 	// behavior of ones we do not handle (e.g. SIGHUP, SIGQUIT).
@@ -224,6 +232,12 @@ func (s *Service) handleSignals() {
 			s.sendStop(nil)
 		}
 	}()
+	return func() {
+		// Stop delivery before closing so no send can race the close, then close to end
+		// the goroutine above.
+		signal.Stop(sigs)
+		close(sigs)
+	}
 }
 
 func (s *Service) sendStop(err error) {
