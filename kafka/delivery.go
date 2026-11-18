@@ -150,7 +150,7 @@ func loadDeliveryConfig() (deliveryConfig, error) {
 	// (e.g. an unrendered template FUNCTION_DELIVERY_RETRY=) as "omitted" would
 	// silently re-enable unlimited delivery, so an empty/blank value is a startup
 	// error. The benign variables keep their empty-is-default leniency.
-	if raw, ok := os.LookupEnv("FUNCTION_DELIVERY_RETRY"); ok {
+	if raw, ok := os.LookupEnv(envFunctionDeliveryRetry); ok {
 		v := strings.TrimSpace(raw)
 		if v == "" {
 			return deliveryConfig{}, fmt.Errorf("invalid FUNCTION_DELIVERY_RETRY %q: must not be empty (omit the variable for unlimited retries)", raw)
@@ -175,7 +175,7 @@ func loadDeliveryConfig() (deliveryConfig, error) {
 		c.retry = n
 	}
 
-	if v, ok := lookupNonEmptyEnv("FUNCTION_DELIVERY_BACKOFF_POLICY"); ok {
+	if v, ok := lookupNonEmptyEnv(envFunctionDeliveryBackoffPolicy); ok {
 		switch strings.ToLower(v) {
 		case string(backoffExponential):
 			c.policy = backoffExponential
@@ -187,7 +187,7 @@ func loadDeliveryConfig() (deliveryConfig, error) {
 	}
 
 	baseDelaySet := false
-	if v, ok := lookupNonEmptyEnv("FUNCTION_DELIVERY_BACKOFF_DELAY"); ok {
+	if v, ok := lookupNonEmptyEnv(envFunctionDeliveryBackoffDelay); ok {
 		d, err := parseNonNegativeDuration("FUNCTION_DELIVERY_BACKOFF_DELAY", v)
 		if err != nil {
 			return deliveryConfig{}, err
@@ -197,7 +197,7 @@ func loadDeliveryConfig() (deliveryConfig, error) {
 	}
 
 	maxDelaySet := false
-	if v, ok := lookupNonEmptyEnv("FUNCTION_DELIVERY_BACKOFF_MAX_DELAY"); ok {
+	if v, ok := lookupNonEmptyEnv(envFunctionDeliveryBackoffMaxDelay); ok {
 		d, err := parseNonNegativeDuration("FUNCTION_DELIVERY_BACKOFF_MAX_DELAY", v)
 		if err != nil {
 			return deliveryConfig{}, err

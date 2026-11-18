@@ -265,7 +265,7 @@ func (s *Service) shutdown(sourceErr error) error {
 }
 
 func listenAddress() string {
-	if v := os.Getenv("LISTEN_ADDRESS"); v != "" {
+	if v := os.Getenv(EnvListenAddress); v != "" {
 		return v
 	}
 	return DefaultListenAddress
