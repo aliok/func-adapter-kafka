@@ -19,83 +19,85 @@ package kafka
 // This file is the adapter half of the func<->func-adapter-kafka environment
 // variable contract. knative/func emits a fixed set of env var names onto the
 // Kafka runtime sidecar; this adapter reads exactly those names. The production
-// read sites look them up through the Env* constants below (consumer.go,
-// security.go, delivery.go, http_adapter.go, service.go, and
-// cmd/fkafka-runtime). A rename or drop on either side silently turns the
-// corresponding setting into a runtime no-op -- a break that a func cluster test
-// surfaces at best as a delivery timeout, and not at all for the optional tuning
-// variables (FUNCTION_DELIVERY_*, FUNCTION_REQUEST_TIMEOUT, KAFKA_TLS_SKIP_VERIFY,
-// the client cert/key), which fall back to defaults silently.
+// read sites look them up through the env* constants below (consumer.go,
+// security.go, delivery.go, http_adapter.go, service.go, and cmd/fkafka-runtime,
+// which reads the exported EnvFunctionTarget). A rename or drop on either side
+// turns the corresponding setting into a runtime no-op. How visibly that fails
+// depends on the name: a required connection/security name (brokers, topic, group,
+// or a TLS/SASL setting the broker actually needs) makes the adapter fail to start
+// or fail its handshake, while the optional tuning names (FUNCTION_DELIVERY_*,
+// FUNCTION_REQUEST_TIMEOUT) and any security setting the broker does not need fall
+// back to defaults silently.
 //
-// This is an adapter-side tripwire, not a cross-repo check. contractEnvVars is
-// a hand-maintained list of the contract names, built from the Env* constants;
-// it is not derived from the read sites, so keeping it complete is on the
-// author. TestContractEnvVars pins that list against a literal copy of func's
-// names -- it does NOT fetch or compare against knative/func. The two lists are
-// kept in lockstep by humans, mirroring kafkaRuntimeContractEnvNames /
+// This is an adapter-side tripwire, not a cross-repo check. contractEnvVars is a
+// hand-maintained list of the contract names, built from the env* constants.
+// TestContractEnvVars pins the VALUES of those constants against a literal copy of
+// func's names; it does NOT run the read sites, and it does NOT fetch or compare
+// against knative/func. Most of these names are also pinned individually by the
+// per-value tests in this package, so a changed constant already fails some unit
+// test; what this list adds is one place that enumerates the whole contract and a
+// failure message that points at func. The two lists are kept in lockstep by
+// humans, mirroring kafkaRuntimeContractEnvNames /
 // TestKafkaSidecarContainer_EnvNameContract in knative/func
-// (pkg/k8s/deployer_test.go). Change the two together; the test failure messages
-// name func so a rename on one side is a prompt to update the other.
+// (pkg/k8s/deployer_test.go); change them together.
 //
 // Note: the error and log messages in this package repeat these names as plain
-// string literals for readability. They are not generated from the Env*
-// constants, so they are not a source of truth for the names -- the constants
-// and contractEnvVars are.
+// string literals for readability, not generated from the constants.
 const (
 	// EnvFunctionTarget is the function URL the adapter POSTs decoded records to.
 	// func sets it to a fixed value; read in cmd/fkafka-runtime.
 	EnvFunctionTarget = "FUNCTION_TARGET"
 
 	// Connection + security. Consumed in consumer.go and security.go.
-	EnvKafkaBrokers          = "KAFKA_BROKERS"
-	EnvKafkaTopic            = "KAFKA_TOPIC"
-	EnvKafkaConsumerGroup    = "KAFKA_CONSUMER_GROUP"
-	EnvKafkaSecurityProtocol = "KAFKA_SECURITY_PROTOCOL"
-	EnvKafkaTLSCACert        = "KAFKA_TLS_CA_CERT"
-	EnvKafkaTLSClientCert    = "KAFKA_TLS_CLIENT_CERT"
-	EnvKafkaTLSClientKey     = "KAFKA_TLS_CLIENT_KEY"
-	EnvKafkaTLSSkipVerify    = "KAFKA_TLS_SKIP_VERIFY"
-	EnvKafkaSASLMechanism    = "KAFKA_SASL_MECHANISM"
-	EnvKafkaSASLUser         = "KAFKA_SASL_USER"
-	EnvKafkaSASLPassword     = "KAFKA_SASL_PASSWORD"
+	envKafkaBrokers          = "KAFKA_BROKERS"
+	envKafkaTopic            = "KAFKA_TOPIC"
+	envKafkaConsumerGroup    = "KAFKA_CONSUMER_GROUP"
+	envKafkaSecurityProtocol = "KAFKA_SECURITY_PROTOCOL"
+	envKafkaTLSCACert        = "KAFKA_TLS_CA_CERT"
+	envKafkaTLSClientCert    = "KAFKA_TLS_CLIENT_CERT"
+	envKafkaTLSClientKey     = "KAFKA_TLS_CLIENT_KEY"
+	envKafkaTLSSkipVerify    = "KAFKA_TLS_SKIP_VERIFY"
+	envKafkaSASLMechanism    = "KAFKA_SASL_MECHANISM"
+	envKafkaSASLUser         = "KAFKA_SASL_USER"
+	envKafkaSASLPassword     = "KAFKA_SASL_PASSWORD"
 
 	// Delivery tuning. Consumed in delivery.go and http_adapter.go.
-	EnvFunctionDeliveryRetry           = "FUNCTION_DELIVERY_RETRY"
-	EnvFunctionDeliveryBackoffPolicy   = "FUNCTION_DELIVERY_BACKOFF_POLICY"
-	EnvFunctionDeliveryBackoffDelay    = "FUNCTION_DELIVERY_BACKOFF_DELAY"
-	EnvFunctionDeliveryBackoffMaxDelay = "FUNCTION_DELIVERY_BACKOFF_MAX_DELAY"
-	EnvFunctionRequestTimeout          = "FUNCTION_REQUEST_TIMEOUT"
+	envFunctionDeliveryRetry           = "FUNCTION_DELIVERY_RETRY"
+	envFunctionDeliveryBackoffPolicy   = "FUNCTION_DELIVERY_BACKOFF_POLICY"
+	envFunctionDeliveryBackoffDelay    = "FUNCTION_DELIVERY_BACKOFF_DELAY"
+	envFunctionDeliveryBackoffMaxDelay = "FUNCTION_DELIVERY_BACKOFF_MAX_DELAY"
+	envFunctionRequestTimeout          = "FUNCTION_REQUEST_TIMEOUT"
 )
 
 // Adapter-only env vars: read by the adapter but NOT part of the func contract,
 // because func does not emit them. Kept out of contractEnvVars on purpose.
 const (
-	EnvFunctionMaxConcurrency = "FUNCTION_MAX_CONCURRENCY"
+	envFunctionMaxConcurrency = "FUNCTION_MAX_CONCURRENCY"
 	EnvListenAddress          = "LISTEN_ADDRESS"
 )
 
 // contractEnvVars is the complete set of env var names this adapter reads that
 // are part of the func<->adapter contract -- i.e. exactly the names func emits
-// onto the sidecar. It is a hand-maintained mirror, built from the Env*
+// onto the sidecar. It is a hand-maintained mirror, built from the env*
 // constants, of kafkaRuntimeContractEnvNames in knative/func. The adapter-only
 // variables above (FUNCTION_MAX_CONCURRENCY, LISTEN_ADDRESS) are deliberately
 // excluded because func does not emit them.
 var contractEnvVars = []string{
 	EnvFunctionTarget,
-	EnvKafkaBrokers,
-	EnvKafkaTopic,
-	EnvKafkaConsumerGroup,
-	EnvKafkaSecurityProtocol,
-	EnvKafkaTLSCACert,
-	EnvKafkaTLSClientCert,
-	EnvKafkaTLSClientKey,
-	EnvKafkaTLSSkipVerify,
-	EnvKafkaSASLMechanism,
-	EnvKafkaSASLUser,
-	EnvKafkaSASLPassword,
-	EnvFunctionDeliveryRetry,
-	EnvFunctionDeliveryBackoffPolicy,
-	EnvFunctionDeliveryBackoffDelay,
-	EnvFunctionDeliveryBackoffMaxDelay,
-	EnvFunctionRequestTimeout,
+	envKafkaBrokers,
+	envKafkaTopic,
+	envKafkaConsumerGroup,
+	envKafkaSecurityProtocol,
+	envKafkaTLSCACert,
+	envKafkaTLSClientCert,
+	envKafkaTLSClientKey,
+	envKafkaTLSSkipVerify,
+	envKafkaSASLMechanism,
+	envKafkaSASLUser,
+	envKafkaSASLPassword,
+	envFunctionDeliveryRetry,
+	envFunctionDeliveryBackoffPolicy,
+	envFunctionDeliveryBackoffDelay,
+	envFunctionDeliveryBackoffMaxDelay,
+	envFunctionRequestTimeout,
 }

@@ -36,19 +36,19 @@ import (
 // listed here so an unset protocol can warn about the ones a caller set but that
 // are being ignored.
 var securityEnvVars = []string{
-	EnvKafkaTLSCACert,
-	EnvKafkaTLSClientCert,
-	EnvKafkaTLSClientKey,
-	EnvKafkaTLSSkipVerify,
-	EnvKafkaSASLUser,
-	EnvKafkaSASLPassword,
-	EnvKafkaSASLMechanism,
+	envKafkaTLSCACert,
+	envKafkaTLSClientCert,
+	envKafkaTLSClientKey,
+	envKafkaTLSSkipVerify,
+	envKafkaSASLUser,
+	envKafkaSASLPassword,
+	envKafkaSASLMechanism,
 }
 
 func configureSecurity(config *sarama.Config) error {
 	// Uppercase so the protocol enum is matched case-insensitively, consistent
 	// with KAFKA_TLS_SKIP_VERIFY's EqualFold check below.
-	protocol := strings.ToUpper(strings.TrimSpace(os.Getenv(EnvKafkaSecurityProtocol)))
+	protocol := strings.ToUpper(strings.TrimSpace(os.Getenv(envKafkaSecurityProtocol)))
 	if protocol == "" {
 		// A caller that set TLS/SASL vars but left the protocol unset would
 		// otherwise connect in cleartext with no indication the settings were
@@ -84,7 +84,7 @@ func configureTLS(config *sarama.Config) error {
 		MinVersion: tls.VersionTLS12,
 	}
 
-	if caPath := os.Getenv(EnvKafkaTLSCACert); caPath != "" {
+	if caPath := os.Getenv(envKafkaTLSCACert); caPath != "" {
 		caCert, err := os.ReadFile(caPath)
 		if err != nil {
 			return fmt.Errorf("reading CA certificate %s: %w", caPath, err)
@@ -97,8 +97,8 @@ func configureTLS(config *sarama.Config) error {
 		log.Debug().Str("path", caPath).Msg("loaded kafka CA certificate")
 	}
 
-	clientCert := os.Getenv(EnvKafkaTLSClientCert)
-	clientKey := os.Getenv(EnvKafkaTLSClientKey)
+	clientCert := os.Getenv(envKafkaTLSClientCert)
+	clientKey := os.Getenv(envKafkaTLSClientKey)
 	if (clientCert != "") != (clientKey != "") {
 		return fmt.Errorf("both KAFKA_TLS_CLIENT_CERT and KAFKA_TLS_CLIENT_KEY must be set for mutual TLS (got cert=%q, key=%q)", clientCert, clientKey)
 	}
@@ -111,7 +111,7 @@ func configureTLS(config *sarama.Config) error {
 		log.Debug().Str("cert", clientCert).Msg("loaded kafka client certificate for mutual TLS")
 	}
 
-	if strings.EqualFold(os.Getenv(EnvKafkaTLSSkipVerify), "true") {
+	if strings.EqualFold(os.Getenv(envKafkaTLSSkipVerify), "true") {
 		tlsConfig.InsecureSkipVerify = true
 		log.Warn().Msg("kafka TLS: broker certificate verification is disabled")
 	}
@@ -123,15 +123,15 @@ func configureTLS(config *sarama.Config) error {
 
 func configureSASL(config *sarama.Config) error {
 	config.Net.SASL.Enable = true
-	config.Net.SASL.User = os.Getenv(EnvKafkaSASLUser)
-	config.Net.SASL.Password = os.Getenv(EnvKafkaSASLPassword)
+	config.Net.SASL.User = os.Getenv(envKafkaSASLUser)
+	config.Net.SASL.Password = os.Getenv(envKafkaSASLPassword)
 	if config.Net.SASL.User == "" || config.Net.SASL.Password == "" {
 		return fmt.Errorf("KAFKA_SASL_USER and KAFKA_SASL_PASSWORD must both be set when SASL is enabled")
 	}
 
 	// Uppercase so the mechanism enum is matched case-insensitively, consistent
 	// with the protocol handling in configureSecurity.
-	mechanism := strings.ToUpper(strings.TrimSpace(os.Getenv(EnvKafkaSASLMechanism)))
+	mechanism := strings.ToUpper(strings.TrimSpace(os.Getenv(envKafkaSASLMechanism)))
 	if mechanism == "" {
 		mechanism = "PLAIN"
 	}

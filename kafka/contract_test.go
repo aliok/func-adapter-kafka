@@ -22,7 +22,7 @@ import "testing"
 // the Kafka runtime sidecar, copied verbatim from kafkaRuntimeContractEnvNames in
 // knative/func (pkg/k8s/deployer_test.go). It is intentionally duplicated here as
 // literal strings so the test does not lean on the adapter's own constants to
-// decide what func emits: contractEnvVars is built from this package's Env*
+// decide what func emits: contractEnvVars is built from this package's env*
 // constants -- the same constants the production read sites use -- so comparing
 // it against these literals catches a renamed or dropped constant on the adapter
 // side. This is not a cross-repo check -- nothing fetches func's list; these
@@ -49,13 +49,16 @@ var goldenContractEnvVars = []string{
 }
 
 // TestContractEnvVars pins the adapter's half of the func<->adapter env-var name
-// contract. It is the hand-kept mirror of TestKafkaSidecarContainer_EnvNameContract
-// in knative/func: that test asserts the names func emits; this one asserts the
-// names the adapter lists as the ones it reads. Neither test compares against the
-// other repo -- each pins its own side against a local copy, and the two copies
-// are kept in lockstep by humans. Changing an Env* constant's value, or dropping it
-// from contractEnvVars, fails a cheap unit test here instead of surfacing only as a
-// flaky cluster run or not at all. A func-side change fails only func's test.
+// contract: it asserts the VALUES of this package's env* constants (gathered in
+// contractEnvVars) equal a local literal copy of the names func emits. It is the
+// hand-kept mirror of TestKafkaSidecarContainer_EnvNameContract in knative/func;
+// neither test compares against the other repo -- each pins its own side against a
+// local copy, kept in lockstep by humans. Most of these names are already pinned
+// individually by the per-value tests in this package, so a changed constant also
+// fails some other unit test; what this list adds is the whole-contract enumeration,
+// duplicate/extra detection, and a failure message that points at func. It pins the
+// constant values only -- it does not run the read sites, so it does not catch a read
+// site that stops using its constant.
 func TestContractEnvVars(t *testing.T) {
 	// A duplicate would be masked by the set comparison below, so catch it first.
 	seen := map[string]bool{}
