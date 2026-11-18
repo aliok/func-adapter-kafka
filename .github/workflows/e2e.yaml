@@ -18,6 +18,10 @@ on:
   pull_request:
     branches: [ 'main', 'release-*' ]
 
+# The job only checks out the repo and runs tests; it needs no write scopes.
+permissions:
+  contents: read
+
 jobs:
   delivery-e2e:
     name: Delivery/retry E2E (real broker)

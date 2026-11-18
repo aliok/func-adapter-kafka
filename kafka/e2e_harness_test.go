@@ -298,7 +298,32 @@ func (h *harness) committedOffset() int64 {
 	if block == nil {
 		return -1
 	}
+	if block.Err != sarama.ErrNoError {
+		h.t.Fatalf("listing group offsets: partition block error: %v", block.Err)
+	}
 	return block.Offset
+}
+
+// assertGroupEmpty asserts the consumer group has no members and is in the Empty
+// state. Called right after a clean stop, it proves the member left the group (the
+// deferred client.Close in the consumer ran, committing final offsets) rather than
+// merely going silent until its session times out. A regression that dropped
+// client.Close or the consumeDone join on shutdown would leave the member present
+// here -- the broker does not expire it until the session timeout (~10s), long after
+// this check runs.
+func (h *harness) assertGroupEmpty(t *testing.T) {
+	t.Helper()
+	descs, err := h.admin.DescribeConsumerGroups([]string{h.group})
+	if err != nil {
+		t.Fatalf("describing consumer group: %v", err)
+	}
+	if len(descs) != 1 {
+		t.Fatalf("describing consumer group: got %d descriptions, want 1", len(descs))
+	}
+	d := descs[0]
+	if d.State != "Empty" || len(d.Members) != 0 {
+		t.Errorf("consumer group after clean stop: state=%q, members=%d; want Empty with 0 members (the member must leave the group on shutdown, not expire by session timeout)", d.State, len(d.Members))
+	}
 }
 
 // highWaterMark returns the next offset that will be assigned on partition 0,
@@ -592,9 +617,7 @@ func waitFor(t *testing.T, timeout time.Duration, desc string, cond func() bool)
 // encoding would otherwise pass a body-only check. wantOffset is the record's Kafka
 // offset, which the runtime encodes into the event ID and the kafka* extensions; the
 // caller knows it because each scenario produces to a fresh single-partition topic
-// seeded at offset 0. Asserting the exact offset also covers the
-// offset-as-decimal-string encoding (kafkaoffset), a prior fix nothing else verifies
-// end to end.
+// seeded at offset 0.
 func assertBinaryCloudEvent(t *testing.T, h *harness, rec reqRecord, wantBody string, wantOffset int64) {
 	t.Helper()
 	if rec.body != wantBody {

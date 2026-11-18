@@ -77,6 +77,10 @@ func TestE2E_HappyPath(t *testing.T) {
 	if err := rs.stop(t); err != nil {
 		t.Errorf("service returned error on stop: %v", err)
 	}
+	// The clean shutdown must leave the consumer group: the deferred client.Close in
+	// the consumer runs (committing final offsets) and the member departs, rather than
+	// lingering until its session times out. This is the only scenario that checks it.
+	h.assertGroupEmpty(t)
 }
 
 // TestE2E_BoundedRetriesExhaustion (scenario 2): with a finite retry budget, a
@@ -281,13 +285,11 @@ func TestE2E_Backoff(t *testing.T) {
 		}
 		// The 800ms lower bound on gap 3 also rules out linear growth (which would
 		// give 600ms there), so this subtest fails if the runtime ignored the policy
-		// and used linear.
+		// and used linear. The lower bounds already require the gaps to grow, so no
+		// separate (and timing-fragile) strict-monotonic check is needed.
 		assertAtLeast(t, "gap 1", gaps[0], 200*time.Millisecond)
 		assertAtLeast(t, "gap 2", gaps[1], 400*time.Millisecond)
 		assertAtLeast(t, "gap 3", gaps[2], 800*time.Millisecond)
-		if !(gaps[1] > gaps[0] && gaps[2] > gaps[1]) {
-			t.Errorf("gaps not growing exponentially: %v", gaps)
-		}
 		if err := rs.stop(t); err != nil {
 			t.Errorf("service returned error on stop: %v", err)
 		}
@@ -321,14 +323,16 @@ func TestE2E_Backoff(t *testing.T) {
 		if len(gaps) < failUntil {
 			t.Fatalf("got %d gaps, want >= %d", len(gaps), failUntil)
 		}
+		// The ascending lower bounds already require the gaps to grow (ruling out a
+		// base-only constant delay), and the upper bound below rules out exponential, so
+		// no separate strict-monotonic check is needed -- adjacent linear gaps differ by
+		// only 150ms, which a single GC/scheduler pause under -race could invert on a
+		// correct run.
 		assertAtLeast(t, "gap 1", gaps[0], 150*time.Millisecond)
 		assertAtLeast(t, "gap 2", gaps[1], 300*time.Millisecond)
 		assertAtLeast(t, "gap 3", gaps[2], 450*time.Millisecond)
 		assertAtLeast(t, "gap 4", gaps[3], 600*time.Millisecond)
 		assertAtLeast(t, "gap 5", gaps[4], 750*time.Millisecond)
-		if !(gaps[1] > gaps[0] && gaps[2] > gaps[1] && gaps[3] > gaps[2] && gaps[4] > gaps[3]) {
-			t.Errorf("gaps not growing monotonically: %v", gaps)
-		}
 		// Linear's 5th gap backoff is ~750ms; exponential's would be a hard minimum of
 		// 2400ms. The runtime sleeps at least the backoff before a retry, so scheduling,
 		// -race and broker round trips can only ADD to a gap, never pull it below the
@@ -570,11 +574,12 @@ func TestE2E_RebalanceDurability(t *testing.T) {
 		return rsA.svc.ready.Load()
 	})
 
-	// The record never succeeded, so across the rebalance its offset must not advance
-	// past the seeded start (0). A committed offset > 0 would mean an unacked record
-	// was marked.
-	if got := h.committedOffset(); got > 0 {
-		t.Errorf("committed offset=%d for a never-acked record across a rebalance; want <= 0 (nothing committed)", got)
+	// The record never succeeded, so across the rebalance the committed offset must
+	// stay exactly at the seeded start (0). The seed guarantees it is 0, and
+	// committedOffset fails on a missing/errored block, so anything other than 0 means
+	// an unacked record was marked.
+	if got := h.committedOffset(); got != 0 {
+		t.Errorf("committed offset=%d for a never-acked record across a rebalance; want 0 (seeded start, nothing newly committed)", got)
 	}
 
 	// Stop B while the record is still failing. The partition moves back to A, so the

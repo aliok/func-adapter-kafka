@@ -22,10 +22,13 @@ test:
 
 ## test-e2e: run the real-broker delivery/retry E2E suite (build tag: e2e).
 ## Requires a reachable Kafka: set KAFKA_E2E_BOOTSTRAP to its bootstrap address
-## (e.g. localhost:9092). Without it the suite skips rather than fails. Run with the
-## race detector: this is the only suite that exercises the real shutdown/consumeDone
-## and sarama consumer-group concurrency.
+## (e.g. localhost:9092). Run with the race detector: this is the only suite that
+## exercises the real shutdown/consumeDone and sarama consumer-group concurrency.
+## Unlike a bare `go test -tags e2e ./...` (where an unset variable correctly skips),
+## this entry point fails if the variable is unset -- its whole job is to run the
+## suite, so a skip-and-pass here would hide that zero scenarios ran.
 test-e2e:
+	@test -n "$$KAFKA_E2E_BOOTSTRAP" || { echo "KAFKA_E2E_BOOTSTRAP must be set (e.g. localhost:9092) to run the E2E suite" >&2; exit 1; }
 	go test -tags e2e -race -count=1 -timeout 15m ./kafka/ -run '^TestE2E'
 
 ## vet: run go vet, including the e2e-tagged files (the default build excludes them).
