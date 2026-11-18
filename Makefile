@@ -27,6 +27,9 @@ test:
 ## Unlike a bare `go test -tags e2e ./...` (where an unset variable correctly skips),
 ## this entry point fails if the variable is unset -- its whole job is to run the
 ## suite, so a skip-and-pass here would hide that zero scenarios ran.
+## Note: the suite runs the production runtime in-process, and its signal handler keeps
+## SIGINT/SIGTERM for the process, so Ctrl-C does NOT interrupt a running suite -- use
+## Ctrl-\ (SIGQUIT) or kill the process to abort.
 test-e2e:
 	@test -n "$$KAFKA_E2E_BOOTSTRAP" || { echo "KAFKA_E2E_BOOTSTRAP must be set (e.g. localhost:9092) to run the E2E suite" >&2; exit 1; }
 	go test -tags e2e -race -count=1 -timeout 15m ./kafka/ -run '^TestE2E'
