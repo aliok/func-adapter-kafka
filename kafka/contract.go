@@ -22,8 +22,10 @@ package kafka
 // read sites look them up through the Env* constants below (consumer.go,
 // security.go, delivery.go, http_adapter.go, service.go, and
 // cmd/fkafka-runtime). A rename or drop on either side silently turns the
-// corresponding setting into a runtime no-op -- a break neither a mock-based
-// adapter test nor a func cluster test would surface.
+// corresponding setting into a runtime no-op -- a break that a func cluster test
+// surfaces at best as a delivery timeout, and not at all for the optional tuning
+// variables (FUNCTION_DELIVERY_*, FUNCTION_REQUEST_TIMEOUT, KAFKA_TLS_SKIP_VERIFY,
+// the client cert/key), which fall back to defaults silently.
 //
 // This is an adapter-side tripwire, not a cross-repo check. contractEnvVars is
 // a hand-maintained list of the contract names, built from the Env* constants;
@@ -76,9 +78,8 @@ const (
 // are part of the func<->adapter contract -- i.e. exactly the names func emits
 // onto the sidecar. It is a hand-maintained mirror, built from the Env*
 // constants, of kafkaRuntimeContractEnvNames in knative/func. The adapter-only
-// variables above
-// (FUNCTION_MAX_CONCURRENCY, LISTEN_ADDRESS) are deliberately excluded because
-// func does not emit them.
+// variables above (FUNCTION_MAX_CONCURRENCY, LISTEN_ADDRESS) are deliberately
+// excluded because func does not emit them.
 var contractEnvVars = []string{
 	EnvFunctionTarget,
 	EnvKafkaBrokers,
