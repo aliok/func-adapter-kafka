@@ -74,8 +74,9 @@ const (
 
 // contractEnvVars is the complete set of env var names this adapter reads that
 // are part of the func<->adapter contract -- i.e. exactly the names func emits
-// onto the sidecar. It is a hand-maintained literal mirror of
-// kafkaRuntimeContractEnvNames in knative/func. The adapter-only variables above
+// onto the sidecar. It is a hand-maintained mirror, built from the Env*
+// constants, of kafkaRuntimeContractEnvNames in knative/func. The adapter-only
+// variables above
 // (FUNCTION_MAX_CONCURRENCY, LISTEN_ADDRESS) are deliberately excluded because
 // func does not emit them.
 var contractEnvVars = []string{

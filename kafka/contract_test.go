@@ -53,9 +53,9 @@ var goldenContractEnvVars = []string{
 // in knative/func: that test asserts the names func emits; this one asserts the
 // names the adapter lists as the ones it reads. Neither test compares against the
 // other repo -- each pins its own side against a local copy, and the two copies
-// are kept in lockstep by humans. A rename or drop applied to only one side (which
-// would silently no-op a setting at runtime) fails a cheap unit test here instead
-// of surfacing only as a flaky cluster run or not at all.
+// are kept in lockstep by humans. Changing an Env* constant's value, or dropping it
+// from contractEnvVars, fails a cheap unit test here instead of surfacing only as a
+// flaky cluster run or not at all. A func-side change fails only func's test.
 func TestContractEnvVars(t *testing.T) {
 	// A duplicate would be masked by the set comparison below, so catch it first.
 	seen := map[string]bool{}
