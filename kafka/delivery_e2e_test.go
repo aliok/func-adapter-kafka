@@ -528,7 +528,7 @@ func TestE2E_RestartDurability(t *testing.T) {
 	}
 }
 
-// TestE2E_RebalanceDurability (scenario 8, rebalance half): while a record is failing
+// TestE2E_RebalanceDurability (scenario 9): while a record is failing
 // under unlimited retries, a second Service joins the same group and forces a
 // rebalance of the single partition -- exercising two paths reachable only through a
 // real group rebalance: the consume-loop re-entry (client.Consume returning and being
@@ -575,9 +575,9 @@ func TestE2E_RebalanceDurability(t *testing.T) {
 	})
 
 	// The record never succeeded, so across the rebalance the committed offset must
-	// stay exactly at the seeded start (0). The seed guarantees it is 0, and
-	// committedOffset fails on a missing/errored block, so anything other than 0 means
-	// an unacked record was marked.
+	// stay exactly at the seeded start (0). The seed guarantees it is 0; committedOffset
+	// fails the test on an errored block and returns -1 for a missing one, so the != 0
+	// check catches any drift -- an advanced offset, a missing block, or an error.
 	if got := h.committedOffset(); got != 0 {
 		t.Errorf("committed offset=%d for a never-acked record across a rebalance; want 0 (seeded start, nothing newly committed)", got)
 	}
@@ -605,7 +605,7 @@ func TestE2E_RebalanceDurability(t *testing.T) {
 	}
 }
 
-// TestE2E_InvalidConfigFailsFast (scenario 9): an invalid FUNCTION_DELIVERY_* value
+// TestE2E_InvalidConfigFailsFast (scenario 10): an invalid FUNCTION_DELIVERY_* value
 // is rejected at the PROCESS level -- the built runtime binary exits non-zero with a
 // message naming the offending variable, before the function-target wait. Running the
 // real binary is what distinguishes this from the loader unit tests (which already
@@ -672,7 +672,7 @@ func TestE2E_InvalidConfigFailsFast(t *testing.T) {
 	}
 }
 
-// TestE2E_NewGroupStartsAtNewest (default start position): a brand-new group with no
+// TestE2E_NewGroupStartsAtNewest (scenario 11, default start position): a brand-new group with no
 // committed offset starts at OffsetNewest (consumer.go), so a record produced before
 // the consumer resolves its start position is NOT delivered, while records produced
 // afterward are. This is the runtime's real first-deploy behavior, which the seeded

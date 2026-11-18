@@ -394,16 +394,42 @@ func (h *harness) startService(t *testing.T, target string, extraEnv map[string]
 	// consumer and health server keep running after their topic is deleted and their
 	// function server is closed, and their errors land in later tests' logs. stop is
 	// idempotent (sync.Once), so an explicit stop still works.
-	t.Cleanup(func() { _ = rs.stop(t) })
+	t.Cleanup(func() {
+		// Surface an early/last error from Start rather than discarding it: if a waitFor
+		// aborted the scenario, this is where Start's real error (e.g. a consumer error)
+		// first becomes visible.
+		if err := rs.stop(t); err != nil {
+			t.Logf("service returned error on cleanup stop: %v", err)
+		}
+	})
 	return rs
 }
 
-// waitReady blocks until the consumer reports ready (partitions assigned).
+// waitReady blocks until the consumer reports ready (partitions assigned). If Start
+// returns before then -- an early failure such as a consumer error -- it fails
+// immediately with that error instead of waiting out the timeout with an opaque
+// "timed out" message.
 func (rs *runningService) waitReady(t *testing.T, timeout time.Duration) {
 	t.Helper()
-	waitFor(t, timeout, "consumer ready (partitions assigned)", func() bool {
-		return rs.svc.ready.Load()
-	})
+	deadline := time.Now().Add(timeout)
+	for {
+		if rs.svc.ready.Load() {
+			return
+		}
+		select {
+		case err := <-rs.errc:
+			// Start exited before becoming ready. Record the result so stop() (and the
+			// registered cleanup) does not block re-reading errc, then fail with the real
+			// cause.
+			rs.stopOnce.Do(func() { rs.stopErr = err })
+			t.Fatalf("service exited before becoming ready: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %s waiting for consumer ready (partitions assigned)", timeout)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // stop cancels the service context and waits for Start to return, which includes
