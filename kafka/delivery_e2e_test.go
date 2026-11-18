@@ -21,6 +21,8 @@ package kafka
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -128,9 +130,10 @@ func TestE2E_BoundedRetriesExhaustion(t *testing.T) {
 func TestE2E_UnlimitedRetriesDefault(t *testing.T) {
 	h := newHarness(t)
 	// Keep failing for many attempts over a window longer than sarama's ~1s
-	// auto-commit interval, so this tells unlimited apart from any finite budget (not
-	// just budgets under 4) and the lag check below cannot pass merely because a
-	// wrongly-marked offset has not been flushed yet.
+	// auto-commit interval, so this distinguishes unlimited from any finite budget up
+	// to 11 retries (attempt 13 succeeds, so it cannot tell unlimited from a budget of
+	// 12+), and the lag check below cannot pass merely because a wrongly-marked offset
+	// has not been flushed yet.
 	const failUntil = 12
 	fs := newFuncServer(t, func(body string, n int) (int, time.Duration) {
 		if body == "recover" && n <= failUntil {
@@ -149,7 +152,7 @@ func TestE2E_UnlimitedRetriesDefault(t *testing.T) {
 	h.produce("recover")
 
 	// Retry ~10 times at ~200ms backoff (~2s), crossing the auto-commit interval
-	// while the function keeps rejecting the record. A finite budget of fewer than 4
+	// while the function keeps rejecting the record. A finite budget of fewer than 9
 	// retries would have given up by now; unlimited keeps going.
 	waitFor(t, deliverTimeout, "record retried ~10 times while function fails", func() bool {
 		return fs.attempts("recover") >= 10
@@ -408,13 +411,19 @@ func TestE2E_PerAttemptTimeout(t *testing.T) {
 
 	h.produce("slow")
 
-	// It must retry past the timed-out attempts and eventually succeed on a fast
-	// one, then commit.
+	// The first slowAttempts attempts exceed the per-attempt timeout; the client gives
+	// up on each (abandoned, not acked) and retries. A later fast attempt then succeeds
+	// within the timeout and commits.
 	waitFor(t, deliverTimeout, "record retried past timed-out attempts", func() bool {
 		return fs.attempts("slow") > slowAttempts
 	})
 	waitFor(t, deliverTimeout, "record eventually acked within timeout", func() bool {
 		return fs.successes("slow") >= 1
+	})
+	// Exactly the slow attempts were abandoned: this proves the timeout fired on them
+	// (and that successes() did not count a still-in-flight slow attempt as the ack).
+	waitFor(t, deliverTimeout, "exactly the slow attempts were abandoned", func() bool {
+		return fs.abandoned("slow") == slowAttempts
 	})
 	waitFor(t, commitTimeout, "offset committed after timeout retries (zero lag)", func() bool {
 		return h.lag() == 0
@@ -443,9 +452,10 @@ func TestE2E_ZeroRetriesSingleAttempt(t *testing.T) {
 
 	h.produce("good0", "poison", "good1")
 
-	// good1 (produced after poison) can only be delivered once poison's single
-	// attempt is done and its offset committed -- the partition is consumed one
-	// record at a time -- so poison's count is final here; no extra wait is needed.
+	// good1 (produced after poison) can only be delivered once poison's single attempt
+	// is done and its offset marked (the commit happens asynchronously) -- the partition
+	// is consumed one record at a time -- so poison's count is final here; no extra wait
+	// is needed.
 	waitFor(t, deliverTimeout, "poison attempted and good1 delivered", func() bool {
 		return fs.attempts("poison") >= 1 && fs.attempts("good1") >= 1
 	})
@@ -547,6 +557,16 @@ func TestE2E_RebalanceDurability(t *testing.T) {
 	rsB := h.startService(t, fs.url(), extraEnv)
 	rsB.waitReady(t, readyTimeout)
 
+	// A must re-enter its consume loop after the rebalance. sarama calls Setup -- which
+	// sets ready -- on the new generation even for a member with zero claims, and A's
+	// previous session's Cleanup cleared ready, so ready returns to true only if consume
+	// was called again. A runtime that consumed once and returned would leave A
+	// not-ready here: a pod that silently stops consuming after its first rebalance
+	// while its liveness probe stays green.
+	waitFor(t, readyTimeout, "member A re-entered its consume loop after the rebalance", func() bool {
+		return rsA.svc.ready.Load()
+	})
+
 	// The record never succeeded, so across the rebalance its offset must not advance
 	// past the seeded start (0). A committed offset > 0 would mean an unacked record
 	// was marked.
@@ -554,24 +574,24 @@ func TestE2E_RebalanceDurability(t *testing.T) {
 		t.Errorf("committed offset=%d for a never-acked record across a rebalance; want <= 0 (nothing committed)", got)
 	}
 
-	// Let whichever member now owns the partition deliver it successfully.
+	// Stop B while the record is still failing. The partition moves back to A, so the
+	// delivery below can only happen if A is actively consuming -- not merely joined.
+	if err := rsB.stop(t); err != nil {
+		t.Errorf("service returned error on stop (member B): %v", err)
+	}
 	failRec.Store(false)
-	waitFor(t, deliverTimeout, "record acked after rebalance", func() bool {
+	waitFor(t, deliverTimeout, "record acked by member A after B leaves", func() bool {
 		return fs.successes("rebal") >= 1
 	})
 	waitFor(t, commitTimeout, "offset committed after rebalance (zero lag)", func() bool {
 		return h.lag() == 0
 	})
-
-	if err := rsB.stop(t); err != nil {
-		t.Errorf("service returned error on stop (member B): %v", err)
-	}
 	if err := rsA.stop(t); err != nil {
 		t.Errorf("service returned error on stop (member A): %v", err)
 	}
 
-	// The record was rejected until after the rebalance settled, so exactly one member
-	// delivered it successfully -- no duplicate ack despite the at-least-once churn.
+	// The record was rejected until after the rebalance settled, so exactly one
+	// successful delivery -- no duplicate ack despite the at-least-once churn.
 	if got := fs.successes("rebal"); got != 1 {
 		t.Errorf("record acked %d times; want exactly 1 across the rebalance", got)
 	}
@@ -596,6 +616,17 @@ func TestE2E_InvalidConfigFailsFast(t *testing.T) {
 		t.Fatalf("building fkafka-runtime: %v\n%s", err, out)
 	}
 
+	// Point FUNCTION_TARGET at a port known to be closed (reserve one, then release it),
+	// so a regression that moved config validation after the function-target wait would
+	// hang on that wait and be caught by the timeout below -- rather than connecting at
+	// once to whatever happens to listen on the default 127.0.0.1:8080 and passing.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserving a closed port: %v", err)
+	}
+	closedTarget := "http://" + ln.Addr().String() + "/"
+	_ = ln.Close()
+
 	// Run with a controlled env (not os.Environ) so an inherited FUNCTION_* value
 	// cannot make the process fail for the wrong reason. Unlimited is expressed by
 	// omitting FUNCTION_DELIVERY_RETRY; a negative value is a typo the runtime must
@@ -604,6 +635,7 @@ func TestE2E_InvalidConfigFailsFast(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin)
 	cmd.Env = []string{
+		envFunctionTarget + "=" + closedTarget,
 		envKafkaBrokers + "=localhost:9092",
 		envKafkaTopic + "=irrelevant",
 		envKafkaConsumerGroup + "=irrelevant",
@@ -629,5 +661,47 @@ func TestE2E_InvalidConfigFailsFast(t *testing.T) {
 	}
 	if elapsed > 10*time.Second {
 		t.Errorf("process took %s to reject bad config; it must fail before the function-target wait", elapsed)
+	}
+}
+
+// TestE2E_NewGroupStartsAtNewest (default start position): a brand-new group with no
+// committed offset starts at OffsetNewest (consumer.go), so a record produced before
+// the consumer resolves its start position is NOT delivered, while records produced
+// afterward are. This is the runtime's real first-deploy behavior, which the seeded
+// scenarios deliberately bypass -- switching the runtime to OffsetOldest (replaying a
+// topic's whole history on first deploy) would fail here. It uses an unseeded harness.
+func TestE2E_NewGroupStartsAtNewest(t *testing.T) {
+	h := newHarnessUnseeded(t)
+	fs := newFuncServer(t, alwaysOK)
+
+	// Produce before any consumer exists. At OffsetNewest this record (offset 0) is
+	// below the start position and must never be delivered.
+	h.produce("old")
+
+	rs := h.startService(t, fs.url(), nil)
+	rs.waitReady(t, readyTimeout)
+
+	// Produce new records until one is delivered. Only a record produced after the
+	// consumer resolved its OffsetNewest start position is delivered; this pacing loop
+	// ends as soon as consumption is observed.
+	var delivered bool
+	for i := 0; i < 150 && !delivered; i++ {
+		h.produce(fmt.Sprintf("new-%d", i))
+		time.Sleep(100 * time.Millisecond)
+		delivered = fs.totalRequests() > 0
+	}
+	if !delivered {
+		t.Fatal("no record was delivered; the consumer never began consuming")
+	}
+
+	// Drain to zero lag, then assert the pre-start record was skipped.
+	waitFor(t, commitTimeout, "committed past the delivered records (zero lag)", func() bool {
+		return h.lag() == 0
+	})
+	if got := fs.attempts("old"); got != 0 {
+		t.Errorf("record produced before the consumer resolved its start position was delivered %d times; OffsetNewest must skip it", got)
+	}
+	if err := rs.stop(t); err != nil {
+		t.Errorf("service returned error on stop: %v", err)
 	}
 }

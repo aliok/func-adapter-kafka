@@ -36,6 +36,7 @@ package kafka
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -60,6 +61,7 @@ const bootstrapEnv = "KAFKA_E2E_BOOTSTRAP"
 // (knative-extensions/func-adapter-kafka#34) merges, replace these with the Env*
 // constants so there is a single source for the names.
 const (
+	envFunctionTarget             = "FUNCTION_TARGET"
 	envKafkaBrokers               = "KAFKA_BROKERS"
 	envKafkaTopic                 = "KAFKA_TOPIC"
 	envKafkaConsumerGroup         = "KAFKA_CONSUMER_GROUP"
@@ -137,7 +139,17 @@ type harness struct {
 	admin    sarama.ClusterAdmin
 }
 
+// newHarness builds the fixtures and seeds the group's start offset to 0, so the
+// runtime reads deterministically from the beginning regardless of when records are
+// produced. Most scenarios want this. Use newHarnessUnseeded to exercise the
+// runtime's real new-group start position (OffsetNewest).
 func newHarness(t *testing.T) *harness {
+	h := newHarnessUnseeded(t)
+	h.seedStartOffset()
+	return h
+}
+
+func newHarnessUnseeded(t *testing.T) *harness {
 	t.Helper()
 	brokers := requireBrokers(t)
 
@@ -200,7 +212,6 @@ func newHarness(t *testing.T) *harness {
 		_ = admin.DeleteTopic(topic)
 		_ = admin.Close()
 	})
-	h.seedStartOffset()
 	return h
 }
 
@@ -211,25 +222,55 @@ func newHarness(t *testing.T) *harness {
 // paper over with a fixed sleep. Committing 0 up front makes the runtime resume from
 // the beginning deterministically, so records may be produced at any time (before or
 // after the consumer is ready) and none is skipped.
+//
+// The first group operation against a fresh broker creates the internal
+// __consumer_offsets topic, whose partitions answer NOT_COORDINATOR /
+// OffsetsLoadInProgress until they finish loading. sarama's ManagePartition retries
+// only a few times with no backoff, inside that window, so the seed is retried here
+// until the coordinator is ready. Commit() reports errors only to sarama's discarded
+// logger, so the committed offset is read back to confirm the commit actually landed
+// -- otherwise a silently-failed commit would bring back the OffsetNewest race this
+// seed exists to remove.
 func (h *harness) seedStartOffset() {
 	h.t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		err := h.trySeedStartOffset()
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("seeding start offset: %v", err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func (h *harness) trySeedStartOffset() error {
 	om, err := sarama.NewOffsetManagerFromClient(h.group, h.client)
 	if err != nil {
-		h.t.Fatalf("creating offset manager: %v", err)
+		return err
 	}
 	defer func() { _ = om.Close() }()
 	pom, err := om.ManagePartition(h.topic, 0)
 	if err != nil {
-		h.t.Fatalf("managing partition offset: %v", err)
+		return err
 	}
 	defer func() { _ = pom.Close() }()
-	// MarkOffset sets the next offset to consume. 0 means "start from the first
-	// record". ResetOffset as well, in case the partition manager initialized its
-	// position at the high-water mark (OffsetNewest), which MarkOffset alone would
-	// not move backward from.
+	// MarkOffset sets the next offset to consume. A group with no prior commit fetches
+	// an initial offset of -1, so MarkOffset(0) is a forward move and takes effect.
 	pom.MarkOffset(0, "")
-	pom.ResetOffset(0, "")
 	om.Commit()
+
+	resp, err := h.admin.ListConsumerGroupOffsets(h.group, map[string][]int32{h.topic: {0}})
+	if err != nil {
+		return err
+	}
+	block := resp.GetBlock(h.topic, 0)
+	if block == nil || block.Err != sarama.ErrNoError || block.Offset != 0 {
+		return fmt.Errorf("commit did not land (block=%+v); retrying", block)
+	}
+	return nil
 }
 
 // produce sends each value as a record to the harness topic, in order.
@@ -377,6 +418,10 @@ type reqRecord struct {
 	at     time.Time
 	status int
 	header http.Header
+	// done is set once the handler has finished (after any scripted delay). Until then
+	// the attempt is still in flight and must not count as a success -- a slow handler
+	// logged with a 2xx has not yet been received by the client.
+	done bool
 	// abandoned is true when the client (the runtime) gave up on the attempt before
 	// the handler responded -- i.e. the request context was cancelled during the
 	// scripted delay, as a per-attempt timeout does. Such an attempt is not a
@@ -418,15 +463,15 @@ func newFuncServer(t *testing.T, respond func(body string, attempt int) (status 
 		if delay > 0 {
 			time.Sleep(delay)
 		}
-		// If the client gave up on this attempt before we responded -- e.g. a
-		// per-attempt timeout elapsed during the delay above -- its request context is
-		// cancelled. Mark the attempt abandoned so successes() does not count a 2xx the
-		// runtime never actually received.
-		if r.Context().Err() != nil {
-			fs.mu.Lock()
-			fs.log[idx].abandoned = true
-			fs.mu.Unlock()
-		}
+		// Mark the attempt complete once the handler has finished. If the client gave up
+		// before we responded -- e.g. a per-attempt timeout elapsed during the delay
+		// above -- its request context is cancelled, so record the attempt as abandoned:
+		// successes() counts only completed, non-abandoned 2xx responses, so neither an
+		// in-flight slow attempt nor one the runtime timed out on is mistaken for an ack.
+		fs.mu.Lock()
+		fs.log[idx].done = true
+		fs.log[idx].abandoned = r.Context().Err() != nil
+		fs.mu.Unlock()
 
 		w.WriteHeader(status)
 	}))
@@ -445,14 +490,29 @@ func (fs *funcServer) attempts(body string) int {
 }
 
 // successes returns how many deliveries of body the runtime actually received as a
-// 2xx ack -- i.e. 2xx responses the client did not abandon first (a timed-out
-// attempt whose handler later returns 200 does not count).
+// 2xx ack -- i.e. completed, non-abandoned 2xx responses. An attempt still in flight
+// (handler sleeping), or one the client timed out on before the handler responded,
+// does not count even though its scripted status is 2xx.
 func (fs *funcServer) successes(body string) int {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	n := 0
 	for _, r := range fs.log {
-		if r.body == body && !r.abandoned && r.status >= 200 && r.status < 300 {
+		if r.body == body && r.done && !r.abandoned && r.status >= 200 && r.status < 300 {
+			n++
+		}
+	}
+	return n
+}
+
+// abandoned returns how many delivery attempts of body the client gave up on before
+// the handler responded (a per-attempt timeout).
+func (fs *funcServer) abandoned(body string) int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	n := 0
+	for _, r := range fs.log {
+		if r.body == body && r.abandoned {
 			n++
 		}
 	}
