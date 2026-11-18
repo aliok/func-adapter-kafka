@@ -133,14 +133,14 @@ func TestE2E_BoundedRetriesExhaustion(t *testing.T) {
 // and is redelivered until the function recovers, at which point it is committed.
 func TestE2E_UnlimitedRetriesDefault(t *testing.T) {
 	h := newHarness(t)
-	// Keep failing for many attempts over a window longer than sarama's ~1s
-	// auto-commit interval, so this distinguishes unlimited from any finite budget up
-	// to 11 retries (attempt 13 succeeds, so it cannot tell unlimited from a budget of
-	// 12+), and the lag check below cannot pass merely because a wrongly-marked offset
-	// has not been flushed yet.
-	const failUntil = 12
-	fs := newFuncServer(t, func(body string, n int) (int, time.Duration) {
-		if body == "recover" && n <= failUntil {
+	// The record fails until this flag is flipped, not after a fixed number of
+	// attempts, so recovery cannot race the lag assertion below: a count-based recovery
+	// could start succeeding (and commit) in the window between observing N attempts and
+	// sampling lag, which would report an unacked commit against a correct runtime.
+	var failing atomic.Bool
+	failing.Store(true)
+	fs := newFuncServer(t, func(body string, _ int) (int, time.Duration) {
+		if body == "recover" && failing.Load() {
 			return 503, 0
 		}
 		return 200, 0
@@ -155,9 +155,10 @@ func TestE2E_UnlimitedRetriesDefault(t *testing.T) {
 
 	h.produce("recover")
 
-	// Retry ~10 times at ~200ms backoff (~2s), crossing the auto-commit interval
-	// while the function keeps rejecting the record. A finite budget of fewer than 9
-	// retries would have given up by now; unlimited keeps going.
+	// Retry ~10 times at ~200ms backoff (~2s), crossing sarama's ~1s auto-commit
+	// interval while the function keeps rejecting the record. A finite budget under ~9
+	// retries would already have exhausted and committed (lag 0) by now, so lag>=1 here
+	// proves the default is unlimited and that no unacked offset was committed.
 	waitFor(t, deliverTimeout, "record retried ~10 times while function fails", func() bool {
 		return fs.attempts("recover") >= 10
 	})
@@ -165,10 +166,10 @@ func TestE2E_UnlimitedRetriesDefault(t *testing.T) {
 		t.Errorf("lag=%d while delivery still failing; unlimited retries must not commit an unacked record", lag)
 	}
 
-	// Once the function starts accepting it (after failUntil), the record is delivered
-	// and committed.
-	waitFor(t, deliverTimeout, "record delivered after function recovers", func() bool {
-		return fs.attempts("recover") > failUntil
+	// Now let the record succeed; it must be delivered (acked) and committed.
+	failing.Store(false)
+	waitFor(t, deliverTimeout, "record acked after function recovers", func() bool {
+		return fs.successes("recover") >= 1
 	})
 	waitFor(t, commitTimeout, "offset committed after recovery (zero lag)", func() bool {
 		return h.lag() == 0

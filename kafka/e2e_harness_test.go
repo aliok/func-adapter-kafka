@@ -496,19 +496,25 @@ func newFuncServer(t *testing.T, respond func(body string, attempt int) (status 
 		// later, not just the body.
 		hdr := r.Header.Clone()
 
+		// Publish the attempt count and its arrival record in ONE critical section, so a
+		// reader that sees the incremented count via attempts() always finds the matching
+		// fs.log entry too. The backoff subtests wait on attempts() and then read gaps();
+		// incrementing the count and appending the record separately would let a
+		// scheduling pause between them drop a gap. Appending here (before the scripted
+		// delay) also keeps gaps()/arrivals() in arrival order when a slow handler is
+		// still sleeping as the next retry arrives. The scripted status is filled in
+		// after respond, and done/abandoned after the delay, but those are only read via
+		// successes(), which requires done.
 		fs.mu.Lock()
 		fs.counts[body]++
 		n := fs.counts[body]
+		idx := len(fs.log)
+		fs.log = append(fs.log, reqRecord{body: body, at: at, header: hdr})
 		fs.mu.Unlock()
 
 		status, delay := fs.respond(body, n)
-
-		// Append in arrival order (before the scripted delay) so gaps()/arrivals()
-		// stay ordered even when a slow handler is still sleeping as the next retry
-		// arrives.
 		fs.mu.Lock()
-		idx := len(fs.log)
-		fs.log = append(fs.log, reqRecord{body: body, at: at, status: status, header: hdr})
+		fs.log[idx].status = status
 		fs.mu.Unlock()
 
 		if delay > 0 {
