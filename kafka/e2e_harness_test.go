@@ -55,24 +55,9 @@ import (
 // (comma-separated) the suite runs against. Unset means skip.
 const bootstrapEnv = "KAFKA_E2E_BOOTSTRAP"
 
-// Env var names the runtime reads. Duplicated here as literals rather than
-// imported so the suite builds against main, where the runtime reads these as
-// literals too. TODO: once the env-name-constant refactor
-// (knative-extensions/func-adapter-kafka#34) merges, replace these with the Env*
-// constants so there is a single source for the names.
-const (
-	envFunctionTarget             = "FUNCTION_TARGET"
-	envKafkaBrokers               = "KAFKA_BROKERS"
-	envKafkaTopic                 = "KAFKA_TOPIC"
-	envKafkaConsumerGroup         = "KAFKA_CONSUMER_GROUP"
-	envListenAddress              = "LISTEN_ADDRESS"
-	envFunctionDeliveryRetry      = "FUNCTION_DELIVERY_RETRY"
-	envFunctionDeliveryBackoffPol = "FUNCTION_DELIVERY_BACKOFF_POLICY"
-	envFunctionDeliveryBackoffDel = "FUNCTION_DELIVERY_BACKOFF_DELAY"
-	envFunctionDeliveryBackoffMax = "FUNCTION_DELIVERY_BACKOFF_MAX_DELAY"
-	envFunctionRequestTimeout     = "FUNCTION_REQUEST_TIMEOUT"
-	envFunctionMaxConcurrency     = "FUNCTION_MAX_CONCURRENCY"
-)
+// The env-var names the runtime reads are the contract constants from contract.go
+// (exported EnvFunctionTarget / EnvListenAddress, unexported env* for the rest);
+// this suite uses those directly rather than redeclaring them.
 
 // runtimeOverrideEnvVars are the delivery/timeout/concurrency variables a scenario
 // drives via extraEnv. startService clears any inherited value before applying the
@@ -83,9 +68,9 @@ const (
 // make New fail before the test even runs.
 var runtimeOverrideEnvVars = []string{
 	envFunctionDeliveryRetry,
-	envFunctionDeliveryBackoffPol,
-	envFunctionDeliveryBackoffDel,
-	envFunctionDeliveryBackoffMax,
+	envFunctionDeliveryBackoffPolicy,
+	envFunctionDeliveryBackoffDelay,
+	envFunctionDeliveryBackoffMaxDelay,
 	envFunctionRequestTimeout,
 	envFunctionMaxConcurrency,
 }
@@ -365,7 +350,7 @@ func (h *harness) startService(t *testing.T, target string, extraEnv map[string]
 	t.Setenv(envKafkaBrokers, strings.Join(h.brokers, ","))
 	t.Setenv(envKafkaTopic, h.topic)
 	t.Setenv(envKafkaConsumerGroup, h.group)
-	t.Setenv(envListenAddress, "127.0.0.1:0")
+	t.Setenv(EnvListenAddress, "127.0.0.1:0")
 	// Start each scenario from a clean slate: unset any inherited runtime override so
 	// only the scenario's extraEnv applies. t.Setenv records the original for
 	// restoration; os.Unsetenv then truly removes it -- a present-but-empty

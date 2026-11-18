@@ -97,9 +97,9 @@ func TestE2E_BoundedRetriesExhaustion(t *testing.T) {
 	})
 
 	rs := h.startService(t, fs.url(), map[string]string{
-		envFunctionDeliveryRetry:      "2", // 3 attempts total
-		envFunctionDeliveryBackoffDel: "50ms",
-		envFunctionDeliveryBackoffMax: "50ms",
+		envFunctionDeliveryRetry:           "2", // 3 attempts total
+		envFunctionDeliveryBackoffDelay:    "50ms",
+		envFunctionDeliveryBackoffMaxDelay: "50ms",
 	})
 	rs.waitReady(t, readyTimeout)
 
@@ -148,8 +148,8 @@ func TestE2E_UnlimitedRetriesDefault(t *testing.T) {
 
 	rs := h.startService(t, fs.url(), map[string]string{
 		// No FUNCTION_DELIVERY_RETRY => unlimited.
-		envFunctionDeliveryBackoffDel: "100ms",
-		envFunctionDeliveryBackoffMax: "200ms",
+		envFunctionDeliveryBackoffDelay:    "100ms",
+		envFunctionDeliveryBackoffMaxDelay: "200ms",
 	})
 	rs.waitReady(t, readyTimeout)
 
@@ -195,8 +195,8 @@ func TestE2E_OffsetSafetyRedelivery(t *testing.T) {
 	})
 
 	extraEnv := map[string]string{
-		envFunctionDeliveryBackoffDel: "50ms",
-		envFunctionDeliveryBackoffMax: "50ms",
+		envFunctionDeliveryBackoffDelay:    "50ms",
+		envFunctionDeliveryBackoffMaxDelay: "50ms",
 	}
 
 	// First session: deliver and commit "committed" (offset 0), then start failing
@@ -263,7 +263,7 @@ func TestE2E_Backoff(t *testing.T) {
 
 	t.Run("exponential", func(t *testing.T) {
 		h := newHarness(t)
-		const failUntil = 3
+		const failUntil = 4
 		fs := newFuncServer(t, func(body string, n int) (int, time.Duration) {
 			if body == "retryme" && n <= failUntil {
 				return 500, 0
@@ -271,9 +271,9 @@ func TestE2E_Backoff(t *testing.T) {
 			return 200, 0
 		})
 		rs := h.startService(t, fs.url(), map[string]string{
-			envFunctionDeliveryBackoffPol: "exponential",
-			envFunctionDeliveryBackoffDel: "200ms",
-			envFunctionDeliveryBackoffMax: "10s",
+			envFunctionDeliveryBackoffPolicy:   "exponential",
+			envFunctionDeliveryBackoffDelay:    "200ms",
+			envFunctionDeliveryBackoffMaxDelay: "10s",
 		})
 		rs.waitReady(t, readyTimeout)
 		h.produce("retryme")
@@ -281,16 +281,20 @@ func TestE2E_Backoff(t *testing.T) {
 			return fs.attempts("retryme") >= failUntil+1
 		})
 		gaps := fs.gaps("retryme")
-		if len(gaps) < 3 {
-			t.Fatalf("got %d gaps, want >= 3", len(gaps))
+		if len(gaps) < failUntil {
+			t.Fatalf("got %d gaps, want >= %d", len(gaps), failUntil)
 		}
-		// The 800ms lower bound on gap 3 also rules out linear growth (which would
-		// give 600ms there), so this subtest fails if the runtime ignored the policy
-		// and used linear. The lower bounds already require the gaps to grow, so no
-		// separate (and timing-fragile) strict-monotonic check is needed.
+		// This subtest is the only guard against "exponential configured, linear
+		// applied", so the ceiling that rules out linear has to have real margin. Gap 4
+		// is ~1600ms exponential vs ~800ms linear; the 1600ms lower bound (720ms floor
+		// after the 90% slack, i.e. 1440ms) sits ~640ms above linear's 800ms, well clear
+		// of per-attempt overhead -- unlike gap 3's 800ms-vs-600ms, which overhead could
+		// close. The ascending lower bounds also require the gaps to grow, so no separate
+		// strict-monotonic check is needed.
 		assertAtLeast(t, "gap 1", gaps[0], 200*time.Millisecond)
 		assertAtLeast(t, "gap 2", gaps[1], 400*time.Millisecond)
 		assertAtLeast(t, "gap 3", gaps[2], 800*time.Millisecond)
+		assertAtLeast(t, "gap 4", gaps[3], 1600*time.Millisecond)
 		if err := rs.stop(t); err != nil {
 			t.Errorf("service returned error on stop: %v", err)
 		}
@@ -311,9 +315,9 @@ func TestE2E_Backoff(t *testing.T) {
 			return 200, 0
 		})
 		rs := h.startService(t, fs.url(), map[string]string{
-			envFunctionDeliveryBackoffPol: "linear",
-			envFunctionDeliveryBackoffDel: "150ms",
-			envFunctionDeliveryBackoffMax: "10s",
+			envFunctionDeliveryBackoffPolicy:   "linear",
+			envFunctionDeliveryBackoffDelay:    "150ms",
+			envFunctionDeliveryBackoffMaxDelay: "10s",
 		})
 		rs.waitReady(t, readyTimeout)
 		h.produce("retryme")
@@ -359,9 +363,9 @@ func TestE2E_Backoff(t *testing.T) {
 			return 200, 0
 		})
 		rs := h.startService(t, fs.url(), map[string]string{
-			envFunctionDeliveryBackoffPol: "exponential",
-			envFunctionDeliveryBackoffDel: "200ms",
-			envFunctionDeliveryBackoffMax: "400ms", // caps at 400ms; uncapped would reach 1600ms+
+			envFunctionDeliveryBackoffPolicy:   "exponential",
+			envFunctionDeliveryBackoffDelay:    "200ms",
+			envFunctionDeliveryBackoffMaxDelay: "400ms", // caps at 400ms; uncapped would reach 1600ms+
 		})
 		rs.waitReady(t, readyTimeout)
 		h.produce("retryme")
@@ -411,9 +415,9 @@ func TestE2E_PerAttemptTimeout(t *testing.T) {
 	})
 
 	rs := h.startService(t, fs.url(), map[string]string{
-		envFunctionRequestTimeout:     "300ms",
-		envFunctionDeliveryBackoffDel: "50ms",
-		envFunctionDeliveryBackoffMax: "50ms",
+		envFunctionRequestTimeout:          "300ms",
+		envFunctionDeliveryBackoffDelay:    "50ms",
+		envFunctionDeliveryBackoffMaxDelay: "50ms",
 	})
 	rs.waitReady(t, readyTimeout)
 
@@ -549,8 +553,8 @@ func TestE2E_RebalanceDurability(t *testing.T) {
 	// No FUNCTION_DELIVERY_RETRY => unlimited, so the record keeps being retried across
 	// the rebalance rather than being skipped and committed.
 	extraEnv := map[string]string{
-		envFunctionDeliveryBackoffDel: "50ms",
-		envFunctionDeliveryBackoffMax: "50ms",
+		envFunctionDeliveryBackoffDelay:    "50ms",
+		envFunctionDeliveryBackoffMaxDelay: "50ms",
 	}
 
 	// Member A joins alone and starts retrying the failing record.
@@ -644,7 +648,7 @@ func TestE2E_InvalidConfigFailsFast(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin)
 	cmd.Env = []string{
-		envFunctionTarget + "=" + closedTarget,
+		EnvFunctionTarget + "=" + closedTarget,
 		envKafkaBrokers + "=localhost:9092",
 		envKafkaTopic + "=irrelevant",
 		envKafkaConsumerGroup + "=irrelevant",
