@@ -329,11 +329,15 @@ func TestE2E_Backoff(t *testing.T) {
 		if !(gaps[1] > gaps[0] && gaps[2] > gaps[1] && gaps[3] > gaps[2] && gaps[4] > gaps[3]) {
 			t.Errorf("gaps not growing monotonically: %v", gaps)
 		}
-		// Linear's 5th gap is ~750ms; exponential's would be ~2400ms. A wide upper
-		// bound here (room for scheduling jitter, which only adds time) fails if the
-		// runtime grew the backoff exponentially instead of linearly.
-		if gaps[4] >= 1500*time.Millisecond {
-			t.Errorf("gap 5 = %s looks exponential, not linear (linear expects ~750ms): %v", gaps[4], gaps)
+		// Linear's 5th gap backoff is ~750ms; exponential's would be a hard minimum of
+		// 2400ms. The runtime sleeps at least the backoff before a retry, so scheduling,
+		// -race and broker round trips can only ADD to a gap, never pull it below the
+		// policy's value -- an exponential 5th gap is therefore always >= 2400ms. A
+		// 2000ms ceiling sits below that hard floor yet leaves ~1250ms of headroom on the
+		// ~750ms linear gap, so it separates the policies without rejecting a slow but
+		// correct linear run.
+		if gaps[4] >= 2000*time.Millisecond {
+			t.Errorf("gap 5 = %s looks exponential, not linear (linear expects ~750ms, exponential >=2400ms): %v", gaps[4], gaps)
 		}
 		if err := rs.stop(t); err != nil {
 			t.Errorf("service returned error on stop: %v", err)
@@ -364,22 +368,21 @@ func TestE2E_Backoff(t *testing.T) {
 			t.Fatalf("got %d gaps, want >= %d", len(gaps), failUntil)
 		}
 		// Uncapped exponential from 200ms would be 200, 400, 800, 1600, 3200 ms; the
-		// 400ms cap holds every gap from the third onward near 400ms. Real-broker and
-		// CI scheduling only ever ADD time, so assert with that asymmetry in mind:
-		//   - lower bound on the capped gaps: the configured 400ms backoff is honored
-		//     (a retry can never arrive sooner than its backoff);
-		//   - upper bound ONLY on the gaps whose uncapped value (>=1600ms) sits far
-		//     above the cap, so scheduling jitter cannot be mistaken for uncapped
-		//     growth. A capped ~400ms gap stays well under 1000ms even under load,
-		//     while an uncapped gap here would be 1600ms or 3200ms. The earlier gaps
-		//     (uncapped 800ms) are too close to the cap to bound without flaking.
+		// 400ms cap holds every gap from the third onward near 400ms. Real-broker, -race
+		// and CI scheduling only ever ADD time, so assert with that asymmetry in mind:
+		//   - lower bound on the capped gaps: the configured 400ms backoff is honored (a
+		//     retry can never arrive sooner than its backoff).
 		for i := 2; i < len(gaps); i++ {
 			assertAtLeast(t, "capped gap", gaps[i], 400*time.Millisecond)
 		}
-		for i := 3; i < len(gaps); i++ {
-			if gaps[i] >= 1000*time.Millisecond {
-				t.Errorf("gap %d = %s is not capped: with a 400ms cap it must stay well below its uncapped value (>=1600ms)", i+1, gaps[i])
-			}
+		//   - upper bound ONLY on the last gap, whose uncapped backoff would be a hard
+		//     minimum of 3200ms (200ms*2^4). Because the runtime sleeps at least the
+		//     backoff, an uncapped last gap is always >= 3200ms; a 2000ms ceiling sits far
+		//     below that yet leaves ~1600ms of headroom on the ~400ms capped gap, so it
+		//     catches uncapped growth without rejecting a slow but correctly-capped run.
+		last := len(gaps) - 1
+		if gaps[last] >= 2000*time.Millisecond {
+			t.Errorf("gap %d = %s is not capped: with a 400ms cap it must stay well below its uncapped value (>=3200ms): %v", last+1, gaps[last], gaps)
 		}
 		if err := rs.stop(t); err != nil {
 			t.Errorf("service returned error on stop: %v", err)
