@@ -86,47 +86,57 @@ func TestHandleSignals_CleanupRestoresDefaultTermination(t *testing.T) {
 	}
 }
 
-// TestStart_UnregistersSignalHandlerOnReturn exercises the fix at its call site: it
-// drives the real Start, cancels it, waits for it to return, then delivers a SIGINT
-// and asserts the Service's handler no longer fires. The handleSignals tests above
-// call the cleanup directly; this one proves Start actually invokes it (defer
-// stopSignals). Removing that defer makes this fail: the leaked handler sends to
-// svc.stop.
-func TestStart_UnregistersSignalHandlerOnReturn(t *testing.T) {
+// TestStart_SignalHandlerLifecycle covers the signal handler end to end through Start,
+// both directions: while Start runs, a SIGTERM must reach the handler and stop it
+// cleanly (the handler is registered); and after Start returns, a SIGINT must no longer
+// reach the Service (the deferred cleanup unregistered it). The direct handleSignals
+// tests above exercise neither through Start. Verified by mutation: unregistering
+// immediately (stopSignals() instead of defer) fails the SIGTERM stop; dropping the
+// defer fails the post-return check.
+func TestStart_SignalHandlerLifecycle(t *testing.T) {
 	// Bind an ephemeral loopback port like the other Start tests; without this Start
-	// binds DefaultListenAddress ([::]:8080), which is a fixed port -- often taken (it
-	// is the function's own default), making net.Listen fail before the health server
-	// ever starts.
+	// binds DefaultListenAddress ([::]:8080), a fixed port often already taken (it is
+	// the function's own default), making net.Listen fail before the health server
+	// starts.
 	t.Setenv("LISTEN_ADDRESS", "127.0.0.1:0")
 
-	// Keep SIGINT from killing the test binary once we deliver it below.
-	guard := make(chan os.Signal, 1)
-	signal.Notify(guard, syscall.SIGINT)
+	// Guard both signals so the ones we deliver don't kill the test binary. cap 2: one
+	// SIGTERM to stop Start, one SIGINT afterward.
+	guard := make(chan os.Signal, 2)
+	signal.Notify(guard, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(guard)
 
 	svc := newService(stubAdapter{})
-	svc.target = refusedTarget(t) // Start blocks in the target wait until we cancel.
+	svc.target = refusedTarget(t) // Start blocks in the target wait.
 	svc.targetWaitTimeout = 30 * time.Second
 
-	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- svc.Start(ctx) }()
+	go func() { done <- svc.Start(context.Background()) }()
 
-	// Once the health server is listening, Start is past Listen (and thus past
-	// handleSignals); cancel for a clean shutdown and wait for Start to return nil.
+	// While Start is running, SIGTERM must reach its handler and stop it cleanly. This
+	// fails if the handler is not registered during Start.
 	waitForHealthServer(t, svc)
-	cancel()
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Start after a clean context cancel = %v, want nil", err)
+			t.Fatalf("Start after SIGTERM = %v, want nil", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("Start did not return after context cancel")
+		t.Fatal("SIGTERM did not stop Start; handler not registered while running")
+	}
+	// Drain the SIGTERM that also landed on the guard, so the SIGINT check below reads
+	// the SIGINT, not the leftover SIGTERM.
+	select {
+	case <-guard:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SIGTERM not delivered to guard")
 	}
 
-	// Start has returned, so its deferred cleanup must have unregistered the handler: a
-	// SIGINT must reach only the guard, not the Service.
+	// After Start returns, its deferred cleanup must have unregistered the handler: a
+	// SIGINT must now reach only the guard, not the Service.
 	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
 		t.Fatal(err)
 	}
