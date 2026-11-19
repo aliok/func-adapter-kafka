@@ -168,9 +168,12 @@ func TestE2E_UnlimitedRetriesDefault(t *testing.T) {
 	h.produce("recover")
 
 	// Retry ~10 times at ~200ms backoff (~2s), crossing sarama's ~1s auto-commit
-	// interval while the function keeps rejecting the record. A finite budget under ~9
-	// retries would already have exhausted and committed (lag 0) by now, so lag>=1 here
-	// proves the default is unlimited and that no unacked offset was committed.
+	// interval while the function keeps rejecting the record. This proves two things: no
+	// unacked offset is committed while retrying (lag stays >= 1 across the interval,
+	// below), and the default budget is not small (it reaches a 10th attempt). It does
+	// not by itself prove the default is strictly unlimited -- a very large finite
+	// default would also pass; the unlimited default is pinned by the unit test in
+	// delivery_test.go.
 	waitFor(t, deliverTimeout, "record retried ~10 times while function fails", func() bool {
 		return fs.attempts("recover") >= 10
 	})
@@ -318,9 +321,13 @@ func TestE2E_Backoff(t *testing.T) {
 		assertAtLeast(t, "gap 2", gaps[1], 400*time.Millisecond)
 		assertAtLeast(t, "gap 3", gaps[2], 800*time.Millisecond)
 		assertAtLeast(t, "gap 4", gaps[3], 1600*time.Millisecond)
-		// Gap 1 is the base (~200ms); a fixed-delay loop would make it large (e.g. a
-		// constant ~3200ms). The 1500ms ceiling rejects that with wide margin.
-		assertAtMost(t, "gap 1 (growth, not fixed delay)", gaps[0], 1500*time.Millisecond)
+		// Gap 1 is the base (~200ms). A fixed-delay loop stuck at this subtest's largest
+		// backoff (gap 4, ~1600ms) would make gap 1 ~1600ms, so the 1000ms ceiling rejects
+		// it with margin on both sides (real ~200ms well under it; a >=1600ms constant well
+		// over it). This subtest alone would still accept a constant near 1000-1440ms, but
+		// the linear subtest rejects every constant delay and backoffFor is shared, so the
+		// suite as a whole does.
+		assertAtMost(t, "gap 1 (growth, not fixed delay)", gaps[0], 1000*time.Millisecond)
 		if err := rs.stop(t); err != nil {
 			t.Errorf("service returned error on stop: %v", err)
 		}
