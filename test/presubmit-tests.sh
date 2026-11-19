@@ -26,9 +26,10 @@ export GO111MODULE=on
 source "$(go run knative.dev/hack/cmd/script presubmit-tests.sh)"
 
 # Override the default build phase with the repo's own checks (gofmt + go vet),
-# which the Makefile already encodes.
+# which the Makefile already encodes. Vet the e2e-tagged files too -- the default
+# build excludes them, so otherwise only the E2E job ever compiles them.
 function build_tests() {
-  go vet ./... && gofmt_check
+  go vet ./... && go vet -tags e2e ./... && gofmt_check
 }
 
 function gofmt_check() {

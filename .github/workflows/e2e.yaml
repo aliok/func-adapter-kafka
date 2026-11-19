@@ -26,6 +26,9 @@ jobs:
   delivery-e2e:
     name: Delivery/retry E2E (real broker)
     runs-on: ubuntu-latest
+    # go test is capped at 15m; bound the whole job so a hung image pull or broker
+    # start cannot fall back to the 6h default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 

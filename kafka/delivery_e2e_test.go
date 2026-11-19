@@ -111,9 +111,6 @@ func TestE2E_BoundedRetriesExhaustion(t *testing.T) {
 	waitFor(t, deliverTimeout, "poison attempted up to its budget", func() bool {
 		return fs.attempts("poison") >= 3
 	})
-	if got := fs.attempts("poison"); got != 3 {
-		t.Errorf("poison attempted %d times, want exactly 3 (retry=2 => 3 attempts)", got)
-	}
 	// The committed offset must reach 2: good-before (0) acked and committed, poison (1)
 	// skipped and committed. Observing offset 2 BEFORE the next record is produced is
 	// what proves the exhaustion skip committed poison -- a later successful record's
@@ -121,6 +118,13 @@ func TestE2E_BoundedRetriesExhaustion(t *testing.T) {
 	waitFor(t, commitTimeout, "poison's offset committed by the exhaustion skip (committed offset 2)", func() bool {
 		return h.committedOffset() == 2
 	})
+	// Check the exact count only after the skip has committed: by now no further attempt
+	// can land, so an off-by-one that allowed a 4th attempt (attempt > maxAttempts rather
+	// than >=) is visible here. Checking right after the ">= 3" wait would run ~50ms after
+	// the 3rd attempt and miss a 4th that arrives after its backoff.
+	if got := fs.attempts("poison"); got != 3 {
+		t.Errorf("poison attempted %d times, want exactly 3 (retry=2 => 3 attempts)", got)
+	}
 
 	// Only now produce the next good record; it must be delivered, confirming the
 	// partition continues past the skipped poison.
@@ -305,11 +309,11 @@ func TestE2E_Backoff(t *testing.T) {
 		}
 		// This subtest is the only guard against "exponential configured, linear
 		// applied", so the ceiling that rules out linear has to have real margin. Gap 4
-		// is ~1600ms exponential vs ~800ms linear; the 1600ms lower bound (720ms floor
-		// after the 90% slack, i.e. 1440ms) sits ~640ms above linear's 800ms, well clear
-		// of per-attempt overhead -- unlike gap 3's 800ms-vs-600ms, which overhead could
-		// close. The ascending lower bounds also require the gaps to grow, so no separate
-		// strict-monotonic check is needed.
+		// is ~1600ms exponential vs ~800ms linear; the 1600ms lower bound (1440ms after
+		// the 90% slack) sits ~640ms above linear's 800ms, well clear of per-attempt
+		// overhead -- unlike gap 3, whose 800ms bound (720ms after slack) is only ~120ms
+		// above linear's 600ms, a margin overhead could close. The ascending lower bounds
+		// also require the gaps to grow, so no separate strict-monotonic check is needed.
 		assertAtLeast(t, "gap 1", gaps[0], 200*time.Millisecond)
 		assertAtLeast(t, "gap 2", gaps[1], 400*time.Millisecond)
 		assertAtLeast(t, "gap 3", gaps[2], 800*time.Millisecond)
@@ -417,10 +421,11 @@ func TestE2E_Backoff(t *testing.T) {
 		if gaps[last] >= 1000*time.Millisecond {
 			t.Errorf("gap %d = %s is not capped: with a 400ms cap it must stay well below its uncapped value (>=1600ms): %v", last+1, gaps[last], gaps)
 		}
-		//   - the first gap is the base (~100ms), well below the 400ms cap. A fixed-delay
-		//     loop that always waited the cap (~400ms) would make it ~400ms, so a 300ms
-		//     ceiling proves the backoff grew into the cap rather than starting flat at it.
-		assertAtMost(t, "gap 1 (growth into the cap, not fixed delay)", gaps[0], 300*time.Millisecond)
+		// No early-gap ceiling here: the only fixed-delay value that would also satisfy
+		// the capped lower bound is ~400ms (the cap itself), so distinguishing it from the
+		// real ~100ms first gap needs a bound too tight to be reliable under load. A
+		// fixed-delay regression is global (backoffFor is shared), so the exponential and
+		// linear subtests' first-gap ceilings already reject it.
 		if err := rs.stop(t); err != nil {
 			t.Errorf("service returned error on stop: %v", err)
 		}
@@ -642,10 +647,12 @@ func TestE2E_RebalanceDurability(t *testing.T) {
 		t.Errorf("service returned error on stop (member A): %v", err)
 	}
 
-	// The record was rejected until after the rebalance settled, so exactly one
-	// successful delivery -- no duplicate ack despite the at-least-once churn.
-	if got := fs.successes("rebal"); got != 1 {
-		t.Errorf("record acked %d times; want exactly 1 across the rebalance", got)
+	// The record must be acked at least once. Delivery is at-least-once, not
+	// exactly-once: a rebalance that cancels the session after the function answers but
+	// before the runtime reads the reply could legitimately redeliver, so do not assert
+	// a single ack -- the zero-lag wait above already confirms the offset advanced.
+	if got := fs.successes("rebal"); got < 1 {
+		t.Errorf("record acked %d times; want at least 1 across the rebalance", got)
 	}
 }
 
