@@ -103,24 +103,32 @@ func TestE2E_BoundedRetriesExhaustion(t *testing.T) {
 	})
 	rs.waitReady(t, readyTimeout)
 
-	h.produce("good-before", "poison", "good-after")
+	// Produce good-before (offset 0) and poison (offset 1) only -- withhold the next
+	// good record so the exhaustion commit can be observed on its own.
+	h.produce("good-before", "poison")
 
-	// The poison record exhausts its budget (3 attempts), is skipped, and the
-	// partition advances to the following good record.
+	// The poison record exhausts its budget (3 attempts), then is skipped.
 	waitFor(t, deliverTimeout, "poison attempted up to its budget", func() bool {
 		return fs.attempts("poison") >= 3
-	})
-	// A partition is consumed one record at a time -- the handler blocks in deliver
-	// until poison is skipped -- so good-after cannot arrive until poison is done.
-	// Once it has, poison's attempt count is final; no extra wait is needed.
-	waitFor(t, deliverTimeout, "good-after delivered past skipped poison", func() bool {
-		return fs.attempts("good-after") >= 1
 	})
 	if got := fs.attempts("poison"); got != 3 {
 		t.Errorf("poison attempted %d times, want exactly 3 (retry=2 => 3 attempts)", got)
 	}
+	// The committed offset must reach 2: good-before (0) acked and committed, poison (1)
+	// skipped and committed. Observing offset 2 BEFORE the next record is produced is
+	// what proves the exhaustion skip committed poison -- a later successful record's
+	// commit would otherwise sweep the offset past poison and hide a missing skip.
+	waitFor(t, commitTimeout, "poison's offset committed by the exhaustion skip (committed offset 2)", func() bool {
+		return h.committedOffset() == 2
+	})
 
-	waitFor(t, commitTimeout, "all offsets committed after skip (zero lag)", func() bool {
+	// Only now produce the next good record; it must be delivered, confirming the
+	// partition continues past the skipped poison.
+	h.produce("good-after")
+	waitFor(t, deliverTimeout, "good-after delivered past skipped poison", func() bool {
+		return fs.attempts("good-after") >= 1
+	})
+	waitFor(t, commitTimeout, "all offsets committed (zero lag)", func() bool {
 		return h.lag() == 0
 	})
 	if err := rs.stop(t); err != nil {
@@ -260,6 +268,17 @@ func TestE2E_Backoff(t *testing.T) {
 			t.Errorf("%s: gap %s shorter than expected backoff %s", label, got, want)
 		}
 	}
+	// assertAtMost bounds an early gap from above. The ascending lower bounds alone do
+	// not prove the backoff GREW: a fixed-delay retry loop (e.g. one that always waited
+	// the largest backoff) would clear every lower bound. Because the first gap is the
+	// smallest expected delay, a generous ceiling on it rejects such a loop without
+	// flaking on scheduling jitter (which only ever adds time).
+	assertAtMost := func(t *testing.T, label string, got, want time.Duration) {
+		t.Helper()
+		if got > want {
+			t.Errorf("%s: gap %s exceeds %s -- looks like a fixed/large delay, not growth from the base", label, got, want)
+		}
+	}
 
 	t.Run("exponential", func(t *testing.T) {
 		h := newHarness(t)
@@ -295,6 +314,9 @@ func TestE2E_Backoff(t *testing.T) {
 		assertAtLeast(t, "gap 2", gaps[1], 400*time.Millisecond)
 		assertAtLeast(t, "gap 3", gaps[2], 800*time.Millisecond)
 		assertAtLeast(t, "gap 4", gaps[3], 1600*time.Millisecond)
+		// Gap 1 is the base (~200ms); a fixed-delay loop would make it large (e.g. a
+		// constant ~3200ms). The 1500ms ceiling rejects that with wide margin.
+		assertAtMost(t, "gap 1 (growth, not fixed delay)", gaps[0], 1500*time.Millisecond)
 		if err := rs.stop(t); err != nil {
 			t.Errorf("service returned error on stop: %v", err)
 		}
@@ -338,6 +360,9 @@ func TestE2E_Backoff(t *testing.T) {
 		assertAtLeast(t, "gap 3", gaps[2], 450*time.Millisecond)
 		assertAtLeast(t, "gap 4", gaps[3], 600*time.Millisecond)
 		assertAtLeast(t, "gap 5", gaps[4], 750*time.Millisecond)
+		// Gap 1 is the base (~150ms); a fixed-delay loop would make it large (e.g. a
+		// constant ~750ms). The 500ms ceiling rejects that while leaving headroom.
+		assertAtMost(t, "gap 1 (growth, not fixed delay)", gaps[0], 500*time.Millisecond)
 		// Linear's 5th gap backoff is ~750ms; exponential's would be a hard minimum of
 		// 2400ms. The runtime sleeps at least the backoff before a retry, so scheduling,
 		// -race and broker round trips can only ADD to a gap, never pull it below the
@@ -364,8 +389,8 @@ func TestE2E_Backoff(t *testing.T) {
 		})
 		rs := h.startService(t, fs.url(), map[string]string{
 			envFunctionDeliveryBackoffPolicy:   "exponential",
-			envFunctionDeliveryBackoffDelay:    "200ms",
-			envFunctionDeliveryBackoffMaxDelay: "400ms", // caps at 400ms; uncapped would reach 1600ms+
+			envFunctionDeliveryBackoffDelay:    "100ms",
+			envFunctionDeliveryBackoffMaxDelay: "400ms", // caps at 400ms; uncapped would reach 1600ms
 		})
 		rs.waitReady(t, readyTimeout)
 		h.produce("retryme")
@@ -376,23 +401,26 @@ func TestE2E_Backoff(t *testing.T) {
 		if len(gaps) < failUntil {
 			t.Fatalf("got %d gaps, want >= %d", len(gaps), failUntil)
 		}
-		// Uncapped exponential from 200ms would be 200, 400, 800, 1600, 3200 ms; the
-		// 400ms cap holds every gap from the third onward near 400ms. Real-broker, -race
-		// and CI scheduling only ever ADD time, so assert with that asymmetry in mind:
-		//   - lower bound on the capped gaps: the configured 400ms backoff is honored (a
-		//     retry can never arrive sooner than its backoff).
+		// Uncapped exponential from 100ms would be 100, 200, 400, 800, 1600 ms; the 400ms
+		// cap holds every gap from the third onward at ~400ms. Real-broker, -race and CI
+		// scheduling only ever ADD time, so assert with that asymmetry in mind:
+		//   - lower bound on the capped gaps (index >= 2, where backoff has reached the
+		//     cap): the configured 400ms backoff is honored.
 		for i := 2; i < len(gaps); i++ {
 			assertAtLeast(t, "capped gap", gaps[i], 400*time.Millisecond)
 		}
-		//   - upper bound ONLY on the last gap, whose uncapped backoff would be a hard
-		//     minimum of 3200ms (200ms*2^4). Because the runtime sleeps at least the
-		//     backoff, an uncapped last gap is always >= 3200ms; a 2000ms ceiling sits far
-		//     below that yet leaves ~1600ms of headroom on the ~400ms capped gap, so it
-		//     catches uncapped growth without rejecting a slow but correctly-capped run.
+		//   - upper bound on the last gap, whose uncapped backoff would be a hard minimum
+		//     of 1600ms (100ms*2^4). Because the runtime sleeps at least the backoff, an
+		//     uncapped last gap is always >= 1600ms; a 1000ms ceiling sits below that yet
+		//     leaves ~600ms of headroom on the ~400ms capped gap.
 		last := len(gaps) - 1
-		if gaps[last] >= 2000*time.Millisecond {
-			t.Errorf("gap %d = %s is not capped: with a 400ms cap it must stay well below its uncapped value (>=3200ms): %v", last+1, gaps[last], gaps)
+		if gaps[last] >= 1000*time.Millisecond {
+			t.Errorf("gap %d = %s is not capped: with a 400ms cap it must stay well below its uncapped value (>=1600ms): %v", last+1, gaps[last], gaps)
 		}
+		//   - the first gap is the base (~100ms), well below the 400ms cap. A fixed-delay
+		//     loop that always waited the cap (~400ms) would make it ~400ms, so a 300ms
+		//     ceiling proves the backoff grew into the cap rather than starting flat at it.
+		assertAtMost(t, "gap 1 (growth into the cap, not fixed delay)", gaps[0], 300*time.Millisecond)
 		if err := rs.stop(t); err != nil {
 			t.Errorf("service returned error on stop: %v", err)
 		}
@@ -462,19 +490,30 @@ func TestE2E_ZeroRetriesSingleAttempt(t *testing.T) {
 	})
 	rs.waitReady(t, readyTimeout)
 
-	h.produce("good0", "poison", "good1")
+	// Produce good0 (offset 0) and poison (offset 1) only -- withhold good1 so the skip
+	// commit can be observed on its own.
+	h.produce("good0", "poison")
 
-	// good1 (produced after poison) can only be delivered once poison's single attempt
-	// is done and its offset marked (the commit happens asynchronously) -- the partition
-	// is consumed one record at a time -- so poison's count is final here; no extra wait
-	// is needed.
-	waitFor(t, deliverTimeout, "poison attempted and good1 delivered", func() bool {
-		return fs.attempts("poison") >= 1 && fs.attempts("good1") >= 1
+	// poison gets a single attempt (retry=0), then is skipped.
+	waitFor(t, deliverTimeout, "poison attempted once", func() bool {
+		return fs.attempts("poison") >= 1
+	})
+	// The committed offset must reach 2: good0 (0) acked and committed, poison (1)
+	// skipped and committed. Observing offset 2 BEFORE the next record is produced is
+	// what proves the skip committed poison, rather than a later record's commit
+	// sweeping past it.
+	waitFor(t, commitTimeout, "poison's offset committed by the skip (committed offset 2)", func() bool {
+		return h.committedOffset() == 2
 	})
 	if got := fs.attempts("poison"); got != 1 {
 		t.Errorf("poison attempted %d times, want exactly 1 (retry=0 => single attempt)", got)
 	}
 
+	// Only now produce the next good record; it must be delivered past the skipped poison.
+	h.produce("good1")
+	waitFor(t, deliverTimeout, "good1 delivered past skipped poison", func() bool {
+		return fs.attempts("good1") >= 1
+	})
 	waitFor(t, commitTimeout, "all offsets committed (zero lag)", func() bool {
 		return h.lag() == 0
 	})
